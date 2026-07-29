@@ -166,6 +166,26 @@ mod tests {
         assert_eq!(out, vec![0xAA, 0xBB, 0x11, 0x22, 0xCC, 0xDD, 0x33, 0x44]);
     }
 
+    /// End-to-end on the real test card: the thick bar must be red and the thin
+    /// bar black, in different planes. This is the encoder half of the hardware
+    /// check — if it passes and the label still comes out wrong, the fault is
+    /// the firmware's plane order, not ours.
+    #[test]
+    fn test_card_puts_thick_bar_in_red_plane() {
+        let (rgb, w, h) = crate::bitmap::create_two_colour_card(34, 34);
+        let (red, black, cols, bpl) = rgb_to_planes(&rgb, w, h);
+        assert_eq!((cols, bpl), (h, w / 8));
+
+        let ink = |plane: &[u8]| -> usize { plane.iter().map(|b| b.count_ones() as usize).sum() };
+        let (red_dots, black_dots) = (ink(&red), ink(&black));
+        assert!(red_dots > 0 && black_dots > 0);
+        // The red bar is 3/10 of the height, the black bar 3/20 — twice as thick.
+        assert!(
+            red_dots > black_dots,
+            "red {red_dots} should exceed black {black_dots}"
+        );
+    }
+
     #[test]
     fn interleave_rejects_mismatched_planes() {
         assert!(interleave_planes(&[0; 4], &[0; 2], 2, 2).is_none());

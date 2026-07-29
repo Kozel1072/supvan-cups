@@ -237,6 +237,54 @@ pub fn create_swatch_ladder(
     (buf, height_dots, bytes_per_line, band_cols)
 }
 
+/// Build an RGB test card for two-colour mode: a thick red bar above a thin
+/// black bar.
+///
+/// Deliberately asymmetric in *both* colour and thickness, because it has two
+/// jobs at once — telling us whether the firmware honours the mode at all, and
+/// whether plane 0 is red or black. If the thick bar prints black, the planes
+/// are the other way round from what
+/// [`twocolor::classify`](crate::twocolor::classify) assumes; if the thin bar
+/// lands at the top, the feed direction is inverted.
+///
+/// Returns `(rgb, width_dots, height_dots)`, row-major RGB across the full
+/// printhead with the label content centred.
+pub fn create_two_colour_card(label_width_mm: u32, height_mm: u32) -> (Vec<u8>, u32, u32) {
+    const WHITE: [u8; 3] = [255, 255, 255];
+    const RED: [u8; 3] = [255, 0, 0];
+    const BLACK: [u8; 3] = [0, 0, 0];
+
+    let width = PRINTHEAD_WIDTH_DOTS;
+    let height = height_mm * DOTS_PER_MM;
+    let label_width_dots = (label_width_mm * DOTS_PER_MM).min(width);
+    let x0 = (width - label_width_dots) / 2;
+
+    // Thick red across the upper third, thin black in the lower half. The gap
+    // between them stays blank so heat bleed can't merge the two.
+    let red_rows = height / 10..height * 4 / 10;
+    let black_rows = height * 6 / 10..height * 3 / 4;
+
+    let mut rgb = vec![255u8; (width * height * 3) as usize];
+    for y in 0..height {
+        let colour = if red_rows.contains(&y) {
+            RED
+        } else if black_rows.contains(&y) {
+            BLACK
+        } else {
+            WHITE
+        };
+        if colour == WHITE {
+            continue;
+        }
+        for x in x0..x0 + label_width_dots {
+            let px = ((y * width + x) * 3) as usize;
+            rgb[px..px + 3].copy_from_slice(&colour);
+        }
+    }
+
+    (rgb, width, height)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

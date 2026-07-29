@@ -12,7 +12,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use supvan_proto::bitmap::PRINTHEAD_WIDTH_MM;
+use supvan_proto::bitmap::{PRINTHEAD_WIDTH_MM, create_two_colour_card};
 use supvan_proto::buffer::Density;
 use supvan_proto::printer::Printer;
 use supvan_proto::rfid::{RfidMaterial, heat_presets};
@@ -25,6 +25,20 @@ type CliResult = Result<(), Box<dyn Error>>;
 struct Cli {
     #[command(subcommand)]
     command: Command,
+}
+
+/// Label geometry, shared by every subcommand that writes a material record.
+#[derive(clap::Args, Clone, Copy)]
+struct LabelArgs {
+    /// Label width across the printhead, mm
+    #[arg(long, default_value_t = 40)]
+    width: u8,
+    /// Label length along the feed direction, mm
+    #[arg(long, default_value_t = 30)]
+    length: u8,
+    /// Inter-label gap, mm
+    #[arg(long, default_value_t = DEFAULT_LABEL_GAP_MM)]
+    gap: u8,
 }
 
 #[derive(Subcommand)]
@@ -60,21 +74,19 @@ enum Command {
     Provision {
         /// Bluetooth address or /dev/hidrawN path
         target: String,
-        /// Label width across the printhead, mm
-        #[arg(long, default_value_t = 40)]
-        width: u8,
-        /// Label length along the feed direction, mm
-        #[arg(long, default_value_t = 30)]
-        length: u8,
-        /// Inter-label gap, mm
-        #[arg(long, default_value_t = DEFAULT_LABEL_GAP_MM)]
-        gap: u8,
+        #[command(flatten)]
+        label: LabelArgs,
         /// Heat times as `heat5:heat40`; defaults to the vendor's standard profile
         #[arg(long, value_parser = parse_heat_pair)]
         heat: Option<(u16, u16)>,
         /// Labels remaining to report on the roll
         #[arg(long, default_value_t = 480)]
         count: u32,
+        /// Consumable catalogue code. The vendor treats 5602, 5618-5621 and
+        /// 5686-5692 as two-colour stock; 30000 is its placeholder for
+        /// "not a catalogue item".
+        #[arg(long, default_value_t = 30000)]
+        code: u16,
         /// Material type discriminant (1 = die-cut, 0 = continuous)
         #[arg(long, default_value_t = 1)]
         mat_type: u8,
@@ -85,15 +97,8 @@ enum Command {
     HeatSweep {
         /// Bluetooth address or /dev/hidrawN path
         target: String,
-        /// Label width across the printhead, mm
-        #[arg(long, default_value_t = 40)]
-        width: u8,
-        /// Label length along the feed direction, mm
-        #[arg(long, default_value_t = 30)]
-        length: u8,
-        /// Inter-label gap, mm
-        #[arg(long, default_value_t = DEFAULT_LABEL_GAP_MM)]
-        gap: u8,
+        #[command(flatten)]
+        label: LabelArgs,
         /// Heat profiles to walk, each `heat5:heat40`. Repeatable; defaults to
         /// the three the vendor ships.
         #[arg(long = "heat", value_parser = parse_heat_pair)]
@@ -103,6 +108,22 @@ enum Command {
         #[arg(long, value_delimiter = ',', value_parser = parse_density,
               default_value = "0,2,4,6,8,10,12,15")]
         densities: Vec<Density>,
+    },
+    /// Print a two-colour test card: a thick red bar above a thin black bar.
+    /// Tells us whether the firmware honours two-colour mode at all, and which
+    /// plane is which.
+    TwoColor {
+        /// Bluetooth address or /dev/hidrawN path
+        target: String,
+        /// Label width across the printhead, mm
+        #[arg(long, default_value_t = 40)]
+        width: u8,
+        /// Label length along the feed direction, mm
+        #[arg(long, default_value_t = 30)]
+        length: u8,
+        /// Density as `N` or `BLACK:RED`
+        #[arg(long, value_parser = parse_density, default_value = "8:4")]
+        density: Density,
     },
     /// Scan for Supvan Bluetooth devices (via BlueZ D-Bus)
     Discover,
@@ -260,21 +281,21 @@ fn parse_heat_pair(s: &str) -> Result<(u16, u16), String> {
 }
 
 fn build_material(
-    width: u8,
-    length: u8,
-    gap: u8,
+    label: LabelArgs,
     heat: (u16, u16),
     count: u32,
     mat_type: u8,
+    code: u16,
 ) -> RfidMaterial {
     RfidMaterial {
-        width_mm: width,
-        length_mm: length,
-        gap_mm: gap,
+        width_mm: label.width,
+        length_mm: label.length,
+        gap_mm: label.gap,
         heat_time_5: heat.0,
         heat_time_40: heat.1,
         remaining: count,
         mat_type,
+        code,
         ..Default::default()
     }
 }
@@ -324,24 +345,36 @@ fn hex_upper(bytes: &[u8]) -> String {
 
 async fn cmd_provision(
     target: &str,
-    width: u8,
-    length: u8,
-    gap: u8,
+    label: LabelArgs,
     heat: Option<(u16, u16)>,
     count: u32,
     mat_type: u8,
+    code: u16,
 ) -> CliResult {
     let printer = connect(target)?;
     let heat = heat.unwrap_or(heat_presets::STANDARD);
-    let mat = build_material(width, length, gap, heat, count, mat_type);
+    let mat = build_material(label, heat, count, mat_type, code);
     provision(&printer, &mat).await
+}
+
+async fn cmd_two_color(target: &str, width: u8, length: u8, density: Density) -> CliResult {
+    let printer = connect(target)?;
+    let (rgb, w, h) = create_two_colour_card(width as u32, length as u32);
+
+    eprintln!(
+        "Two-colour card on {width}mm x {length}mm: thick RED bar above a thin BLACK bar, \
+black={} red={}.",
+        density.black, density.red
+    );
+    eprintln!("If the thick bar prints black, the firmware's plane order is the reverse of ours.");
+    printer.print_two_colour(&rgb, w, h, density).await?;
+    eprintln!("Done.");
+    Ok(())
 }
 
 async fn cmd_heat_sweep(
     target: &str,
-    width: u8,
-    length: u8,
-    gap: u8,
+    label: LabelArgs,
     heats: Vec<(u16, u16)>,
     densities: Vec<Density>,
 ) -> CliResult {
@@ -357,14 +390,16 @@ async fn cmd_heat_sweep(
 
     let printer = connect(target)?;
     eprintln!(
-        "Sweeping {} heat profiles x {} densities on {width}mm x {length}mm labels.",
+        "Sweeping {} heat profiles x {} densities on {}mm x {}mm labels.",
+        label.width,
+        label.length,
         heats.len(),
         densities.len()
     );
     eprintln!("Bands run top to bottom in the order printed; annotate each strip as it comes out.");
 
     for (i, heat) in heats.iter().enumerate() {
-        let mat = build_material(width, length, gap, *heat, 480, 1);
+        let mat = build_material(label, *heat, 480, 1, 30000);
         eprintln!(
             "\nStrip {}/{}: heat5={} heat40={}, densities {:?}",
             i + 1,
@@ -375,7 +410,7 @@ async fn cmd_heat_sweep(
         );
         provision(&printer, &mat).await?;
         printer
-            .print_swatch_ladder(width as u32, length as u32, &densities)
+            .print_swatch_ladder(label.width as u32, label.length as u32, &densities)
             .await?;
     }
 
@@ -416,21 +451,24 @@ async fn main() -> ExitCode {
         Command::Feed { target } => cmd_feed(&target).await,
         Command::Provision {
             target,
-            width,
-            length,
-            gap,
+            label,
             heat,
             count,
+            code,
             mat_type,
-        } => cmd_provision(&target, width, length, gap, heat, count, mat_type).await,
+        } => cmd_provision(&target, label, heat, count, mat_type, code).await,
         Command::HeatSweep {
+            target,
+            label,
+            heats,
+            densities,
+        } => cmd_heat_sweep(&target, label, heats, densities).await,
+        Command::TwoColor {
             target,
             width,
             length,
-            gap,
-            heats,
-            densities,
-        } => cmd_heat_sweep(&target, width, length, gap, heats, densities).await,
+            density,
+        } => cmd_two_color(&target, width, length, density).await,
         Command::Discover => {
             cmd_discover();
             Ok(())
@@ -517,17 +555,57 @@ mod tests {
             "1900:1400",
         ])
         .unwrap();
-        let Command::Provision {
+        let Command::Provision { label, heat, .. } = cli.command else {
+            panic!("expected Provision");
+        };
+        assert_eq!((label.width, label.length), (50, 30));
+        assert_eq!(heat, Some((1900, 1400)));
+    }
+
+    /// The catalogue code is how we claim two-colour stock (5618) instead of
+    /// the 30000 placeholder, so its default and override both matter.
+    #[test]
+    fn provision_code_defaults_and_overrides() {
+        let cli = Cli::try_parse_from(["supvan-cli", "provision", "/dev/hidraw11"]).unwrap();
+        let Command::Provision { code, .. } = cli.command else {
+            panic!("expected Provision");
+        };
+        assert_eq!(code, 30000);
+
+        let cli =
+            Cli::try_parse_from(["supvan-cli", "provision", "/dev/hidraw11", "--code", "5618"])
+                .unwrap();
+        let Command::Provision { code, .. } = cli.command else {
+            panic!("expected Provision");
+        };
+        assert_eq!(code, 5618);
+    }
+
+    #[test]
+    fn parse_two_color_density_pair() {
+        let cli = Cli::try_parse_from([
+            "supvan-cli",
+            "two-color",
+            "/dev/hidraw11",
+            "--width",
+            "34",
+            "--length",
+            "34",
+            "--density",
+            "10:3",
+        ])
+        .unwrap();
+        let Command::TwoColor {
             width,
             length,
-            heat,
+            density,
             ..
         } = cli.command
         else {
-            panic!("expected Provision");
+            panic!("expected TwoColor");
         };
-        assert_eq!((width, length), (50, 30));
-        assert_eq!(heat, Some((1900, 1400)));
+        assert_eq!((width, length), (34, 34));
+        assert_eq!(density, Density { black: 10, red: 3 });
     }
 
     /// `N` sets both trims; `BLACK:RED` drives them apart. The split form is the
