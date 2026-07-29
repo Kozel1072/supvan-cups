@@ -423,8 +423,15 @@ Result on a T50M Pro (`T0117A2410211517`), 15 read-only opcodes:
 
 Notably `0x2B HTIME_RD` is **not** implemented, so `0x2C HTIME_SET` almost
 certainly is not either: setting heat time directly, bypassing the RFID record,
-is not available on this unit. `0xBA PAPER_BACK` remains untested — it moves
-paper, so it is deny-listed from the read sweep.
+is not available on this unit.
+
+**`0xBA PAPER_BACK` is not implemented either.** Tested at params 0, 8 and 100
+via `supvan-cli paper-back` (its own command, since `probe-reads` guarantees it
+cannot move paper): every reply was byte-identical to an unallocated opcode, the
+mechanism never moved, and status was unchanged. So while the opcode *exists* in
+the vendor's vocabulary — correcting the earlier claim that no backfeed opcode
+does — this firmware does not honour it. Combined with the inert `savepaper`
+bit, there is no way to reprint over a label that has already been fed.
 
 **Status flag — `FirmwareNeedUpgrade`.** The Linux tool decodes a "firmware
 needs upgrade" flag from status byte `[3] & 0x20` (G-series `gPrintFlag.js`) —

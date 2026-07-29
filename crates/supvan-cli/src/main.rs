@@ -178,6 +178,20 @@ enum Command {
         #[arg(long, value_delimiter = ',', value_parser = parse_opcode)]
         also: Vec<u8>,
     },
+    /// Send PAPER_BACK (0xBA) — reverse feed.
+    ///
+    /// Deliberately its own command rather than an escape hatch in
+    /// `probe-reads`, whose whole guarantee is that it cannot move paper. The
+    /// app declares this opcode and never sends it, so the parameter meaning is
+    /// unknown; the reply is compared against an unallocated opcode first, so a
+    /// firmware that doesn't implement it is identified without anything moving.
+    PaperBack {
+        /// Bluetooth address or /dev/hidrawN path
+        target: String,
+        /// Parameter — meaning unknown, plausibly a distance. Starts at 0.
+        #[arg(long, default_value_t = 0)]
+        param: u16,
+    },
     /// Scan for Supvan Bluetooth devices (via BlueZ D-Bus)
     Discover,
 }
@@ -604,6 +618,54 @@ async fn cmd_probe_reads(target: &str, also: Vec<u8>) -> CliResult {
     Ok(())
 }
 
+async fn cmd_paper_back(target: &str, param: u16) -> CliResult {
+    const COMPARE_LEN: usize = 16;
+    /// Middle of the largest unallocated hole — what "not implemented" looks like.
+    const UNALLOCATED: u8 = 0x50;
+
+    let printer = connect(target)?;
+
+    let baseline = printer
+        .probe_raw(UNALLOCATED, 0)
+        .await?
+        .ok_or("unallocated opcode gave no response; cannot calibrate")?;
+    let baseline = head(&baseline, COMPARE_LEN).to_vec();
+    eprintln!("baseline (unallocated 0x{UNALLOCATED:02X}): {baseline:02x?}");
+
+    let before = printer.query_status().await?;
+    eprintln!("Sending PAPER_BACK (0xBA) param={param} — watch the printer.");
+
+    let resp = printer.probe_raw(cmd::CMD_PAPER_BACK, param).await?;
+    match resp {
+        None => eprintln!("PAPER_BACK -> (no response): not implemented"),
+        Some(r) => {
+            let h = head(&r, COMPARE_LEN);
+            if h == baseline.as_slice() {
+                eprintln!("PAPER_BACK -> {h:02x?}");
+                eprintln!("Identical to an unallocated opcode: NOT implemented, nothing moved.");
+            } else {
+                eprintln!("PAPER_BACK -> {h:02x?}");
+                eprintln!("Differs from the unallocated baseline — the firmware knows this opcode.");
+            }
+        }
+    }
+
+    let after = printer.query_status().await?;
+    match (before, after) {
+        (Some(b), Some(a)) => {
+            eprintln!(
+                "status: print_count {} -> {}, errors {:?} -> {:?}",
+                b.print_count,
+                a.print_count,
+                b.error_description(),
+                a.error_description()
+            );
+        }
+        _ => eprintln!("status: unavailable"),
+    }
+    Ok(())
+}
+
 fn head(resp: &[u8], n: usize) -> &[u8] {
     &resp[..resp.len().min(n)]
 }
@@ -773,6 +835,7 @@ async fn main() -> ExitCode {
             vertical,
         } => cmd_gray_ramp(&target, width, length, dither, steps, density, vertical).await,
         Command::ProbeReads { target, also } => cmd_probe_reads(&target, also).await,
+        Command::PaperBack { target, param } => cmd_paper_back(&target, param).await,
         Command::Discover => {
             cmd_discover();
             Ok(())
