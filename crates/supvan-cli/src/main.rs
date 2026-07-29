@@ -2,14 +2,19 @@
 //! bypassing the IPP/CUPS stack. Connect over Bluetooth (an address) or USB HID
 //! (a `/dev/hidrawN` path) and run a subcommand: `probe` (device/status/material/
 //! version), `material` (loaded label + RFID + remaining count), `test-print`
-//! (a built-in pattern), or `discover` (scan for Supvan Bluetooth devices).
+//! (a built-in pattern), `feed` (advance one label), `provision` (inject a
+//! synthetic material record for stock the printer can't read a tag from),
+//! `heat-sweep` (walk heat time against density to calibrate unknown stock), or
+//! `discover` (scan for Supvan Bluetooth devices).
 
 use std::error::Error;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use supvan_proto::bitmap::PRINTHEAD_WIDTH_MM;
 use supvan_proto::printer::Printer;
+use supvan_proto::rfid::{RfidMaterial, heat_presets};
 use supvan_proto::status::{DEFAULT_LABEL_GAP_MM, DEFAULT_LABEL_HEIGHT_MM, MaterialInfo};
 
 type CliResult = Result<(), Box<dyn Error>>;
@@ -45,6 +50,53 @@ enum Command {
     Feed {
         /// Bluetooth address or /dev/hidrawN path
         target: String,
+    },
+    /// Write a synthetic label-material record, for stock whose RFID tag the
+    /// printer can't read (third-party or foreign-brand rolls)
+    Provision {
+        /// Bluetooth address or /dev/hidrawN path
+        target: String,
+        /// Label width across the printhead, mm
+        #[arg(long, default_value_t = 40)]
+        width: u8,
+        /// Label length along the feed direction, mm
+        #[arg(long, default_value_t = 30)]
+        length: u8,
+        /// Inter-label gap, mm
+        #[arg(long, default_value_t = DEFAULT_LABEL_GAP_MM)]
+        gap: u8,
+        /// Heat times as `heat5:heat40`; defaults to the vendor's standard profile
+        #[arg(long, value_parser = parse_heat_pair)]
+        heat: Option<(u16, u16)>,
+        /// Labels remaining to report on the roll
+        #[arg(long, default_value_t = 480)]
+        count: u32,
+        /// Material type discriminant (1 = die-cut, 0 = continuous)
+        #[arg(long, default_value_t = 1)]
+        mat_type: u8,
+    },
+    /// Sweep heat time against density, printing one calibration strip per heat
+    /// profile. For two-colour thermal stock, this finds the energy at which the
+    /// colour flips.
+    HeatSweep {
+        /// Bluetooth address or /dev/hidrawN path
+        target: String,
+        /// Label width across the printhead, mm
+        #[arg(long, default_value_t = 40)]
+        width: u8,
+        /// Label length along the feed direction, mm
+        #[arg(long, default_value_t = 30)]
+        length: u8,
+        /// Inter-label gap, mm
+        #[arg(long, default_value_t = DEFAULT_LABEL_GAP_MM)]
+        gap: u8,
+        /// Heat profiles to walk, each `heat5:heat40`. Repeatable; defaults to
+        /// the three the vendor ships.
+        #[arg(long = "heat", value_parser = parse_heat_pair)]
+        heats: Vec<(u16, u16)>,
+        /// Densities to lay down the strip, top to bottom
+        #[arg(long, value_delimiter = ',', default_values_t = [0u8, 2, 4, 6, 8, 10, 12, 15])]
+        densities: Vec<u8>,
     },
     /// Scan for Supvan Bluetooth devices (via BlueZ D-Bus)
     Discover,
@@ -177,6 +229,141 @@ async fn cmd_feed(target: &str) -> CliResult {
     Ok(())
 }
 
+/// Parse a `heat5:heat40` pair, e.g. `1700:1200`.
+fn parse_heat_pair(s: &str) -> Result<(u16, u16), String> {
+    let (h5, h40) = s
+        .split_once(':')
+        .ok_or_else(|| format!("expected `heat5:heat40`, got `{s}`"))?;
+    Ok((
+        h5.parse().map_err(|_| format!("bad heat5 `{h5}`"))?,
+        h40.parse().map_err(|_| format!("bad heat40 `{h40}`"))?,
+    ))
+}
+
+fn build_material(
+    width: u8,
+    length: u8,
+    gap: u8,
+    heat: (u16, u16),
+    count: u32,
+    mat_type: u8,
+) -> RfidMaterial {
+    RfidMaterial {
+        width_mm: width,
+        length_mm: length,
+        gap_mm: gap,
+        heat_time_5: heat.0,
+        heat_time_40: heat.1,
+        remaining: count,
+        mat_type,
+        ..Default::default()
+    }
+}
+
+/// The printer commits a written record asynchronously: for a short window
+/// after the bulk write it still serves a half-updated one (observed on a T50M
+/// Pro as a UUID of `00001000000000` between the old all-zero value and the new
+/// one). Poll rather than trusting the first read.
+const PROVISION_SETTLE_POLLS: usize = 10;
+const PROVISION_SETTLE_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Write the record, then read the material back so the caller can see whether
+/// the printer actually took it — the synthetic UUID echoing back is the tell.
+async fn provision(printer: &Printer, mat: &RfidMaterial) -> Result<(), Box<dyn Error>> {
+    printer.set_rfid_data(&mat.encode()).await?;
+
+    let expected = hex_upper(&mat.uuid_bytes());
+    let mut last = None;
+    for _ in 0..PROVISION_SETTLE_POLLS {
+        tokio::time::sleep(PROVISION_SETTLE_INTERVAL).await;
+        let read_back = printer.query_material().await?;
+        if let Some(ref m) = read_back
+            && m.uuid == expected
+        {
+            eprintln!(
+                "Provisioned: {}mm x {}mm, gap {}mm, heat {}/{}, UUID {}",
+                m.width_mm, m.height_mm, m.gap_mm, mat.heat_time_5, mat.heat_time_40, m.uuid
+            );
+            return Ok(());
+        }
+        last = read_back;
+    }
+
+    match last {
+        Some(m) => eprintln!(
+            "Warning: printer still reports UUID {} (wrote {expected}) — record not taken",
+            m.uuid
+        ),
+        None => eprintln!("Warning: no material info after write"),
+    }
+    Ok(())
+}
+
+fn hex_upper(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02X}")).collect()
+}
+
+async fn cmd_provision(
+    target: &str,
+    width: u8,
+    length: u8,
+    gap: u8,
+    heat: Option<(u16, u16)>,
+    count: u32,
+    mat_type: u8,
+) -> CliResult {
+    let printer = connect(target)?;
+    let heat = heat.unwrap_or(heat_presets::STANDARD);
+    let mat = build_material(width, length, gap, heat, count, mat_type);
+    provision(&printer, &mat).await
+}
+
+async fn cmd_heat_sweep(
+    target: &str,
+    width: u8,
+    length: u8,
+    gap: u8,
+    heats: Vec<(u16, u16)>,
+    densities: Vec<u8>,
+) -> CliResult {
+    let heats = if heats.is_empty() {
+        vec![
+            heat_presets::STANDARD,
+            heat_presets::BLACK_MARK,
+            heat_presets::CARDSTOCK,
+        ]
+    } else {
+        heats
+    };
+
+    let printer = connect(target)?;
+    eprintln!(
+        "Sweeping {} heat profiles x {} densities on {width}mm x {length}mm labels.",
+        heats.len(),
+        densities.len()
+    );
+    eprintln!("Bands run top to bottom in the order printed; annotate each strip as it comes out.");
+
+    for (i, heat) in heats.iter().enumerate() {
+        let mat = build_material(width, length, gap, *heat, 480, 1);
+        eprintln!(
+            "\nStrip {}/{}: heat5={} heat40={}, densities {:?}",
+            i + 1,
+            heats.len(),
+            heat.0,
+            heat.1,
+            densities
+        );
+        provision(&printer, &mat).await?;
+        printer
+            .print_swatch_ladder(width as u32, length as u32, &densities)
+            .await?;
+    }
+
+    eprintln!("\nSweep complete: {} strips.", heats.len());
+    Ok(())
+}
+
 fn cmd_discover() {
     eprintln!("Scanning for Supvan devices...");
     eprintln!("(For full D-Bus discovery, use the CUPS backend with 0 args)");
@@ -195,6 +382,23 @@ async fn main() -> ExitCode {
         Command::Material { target } => cmd_material(&target).await,
         Command::TestPrint { target, density } => cmd_test_print(&target, density).await,
         Command::Feed { target } => cmd_feed(&target).await,
+        Command::Provision {
+            target,
+            width,
+            length,
+            gap,
+            heat,
+            count,
+            mat_type,
+        } => cmd_provision(&target, width, length, gap, heat, count, mat_type).await,
+        Command::HeatSweep {
+            target,
+            width,
+            length,
+            gap,
+            heats,
+            densities,
+        } => cmd_heat_sweep(&target, width, length, gap, heats, densities).await,
         Command::Discover => {
             cmd_discover();
             Ok(())
@@ -262,5 +466,78 @@ mod tests {
     fn parse_discover() {
         let cli = Cli::try_parse_from(["supvan-cli", "discover"]).unwrap();
         assert!(matches!(cli.command, Command::Discover));
+    }
+
+    #[test]
+    fn parse_provision_with_heat() {
+        let cli = Cli::try_parse_from([
+            "supvan-cli",
+            "provision",
+            "/dev/hidraw11",
+            "--width",
+            "50",
+            "--length",
+            "30",
+            "--heat",
+            "1900:1400",
+        ])
+        .unwrap();
+        let Command::Provision {
+            width,
+            length,
+            heat,
+            ..
+        } = cli.command
+        else {
+            panic!("expected Provision");
+        };
+        assert_eq!((width, length), (50, 30));
+        assert_eq!(heat, Some((1900, 1400)));
+    }
+
+    #[test]
+    fn heat_pair_needs_a_colon() {
+        assert!(super::parse_heat_pair("1700").is_err());
+        assert!(super::parse_heat_pair("1700:abc").is_err());
+        assert_eq!(super::parse_heat_pair("1700:1200"), Ok((1700, 1200)));
+    }
+
+    #[test]
+    fn parse_heat_sweep_repeats_heat_and_splits_densities() {
+        let cli = Cli::try_parse_from([
+            "supvan-cli",
+            "heat-sweep",
+            "/dev/hidraw11",
+            "--heat",
+            "1700:1200",
+            "--heat",
+            "2500:2000",
+            "--densities",
+            "0,4,8,15",
+        ])
+        .unwrap();
+        let Command::HeatSweep {
+            heats, densities, ..
+        } = cli.command
+        else {
+            panic!("expected HeatSweep");
+        };
+        assert_eq!(heats, vec![(1700, 1200), (2500, 2000)]);
+        assert_eq!(densities, vec![0, 4, 8, 15]);
+    }
+
+    /// Omitting --heat is what selects the three vendor presets at run time, so
+    /// the parsed value must stay empty rather than picking up a clap default.
+    #[test]
+    fn heat_sweep_defaults_to_no_explicit_heats() {
+        let cli = Cli::try_parse_from(["supvan-cli", "heat-sweep", "/dev/hidraw11"]).unwrap();
+        let Command::HeatSweep {
+            heats, densities, ..
+        } = cli.command
+        else {
+            panic!("expected HeatSweep");
+        };
+        assert!(heats.is_empty());
+        assert_eq!(densities, vec![0, 2, 4, 6, 8, 10, 12, 15]);
     }
 }
