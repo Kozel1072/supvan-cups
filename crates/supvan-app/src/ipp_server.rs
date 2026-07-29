@@ -420,10 +420,44 @@ fn configured_heat() -> (u16, u16) {
     })
 }
 
-/// True when the printer read back no usable tag — the vendor's own test, which
-/// its editor spells `UUID.indexOf("00000000") == -1`.
-fn tag_is_blank(uuid: &str) -> bool {
-    uuid.is_empty() || uuid.chars().all(|c| c == '0')
+/// Whether this material record is ours to overwrite.
+///
+/// Three cases reach us, and only one must be protected:
+///
+/// - **Blank stock** — all-zero UUID. The vendor's own gate
+///   (`UUID.indexOf("00000000") == -1`) and plainly ours to define.
+/// - **A record we wrote** — a synthetic UUID like `30000000000000`. Not
+///   all-zero, so the vendor's test alone would refuse it and a roll could be
+///   set exactly once, then never corrected.
+/// - **A genuine consumable** — carries an 8-byte tag signature in `code`,
+///   which is what separates it from the other two: `getT50PlusRFIDData` never
+///   populates `MatCode`, so anything we write has `code` all zeros, and blank
+///   stock has nothing to read.
+///
+/// So the signature is the discriminator, not the UUID.
+///
+/// Caveat worth stating: this assumes a genuine Supvan roll really does carry a
+/// non-zero signature. That is what the field is for and what the vendor's
+/// anti-counterfeit path reads, but it is unverified here — the bench has only
+/// third-party stock. Erring the other way (refusing on any non-zero UUID)
+/// would make the feature single-use, so this is the deliberate trade.
+fn record_is_ours(uuid: &str, code: &str) -> bool {
+    let zeroed = |s: &str| s.is_empty() || s.chars().all(|c| c == '0');
+
+    // A signature is enough on its own to mean hands off, whatever the UUID.
+    if !zeroed(code) {
+        return false;
+    }
+    if zeroed(uuid) {
+        return true;
+    }
+
+    // Ours are `RfidMaterial::uuid_bytes()` output: a decimal catalogue code
+    // (u16, so at most five digits) right-padded with zeros to 14 hex chars.
+    // Strip the padding and what remains must be those few digits — a real
+    // 7-byte tag UID is hex and would not reduce to that.
+    let stem = uuid.trim_end_matches('0');
+    stem.len() <= 5 && stem.chars().all(|c| c.is_ascii_digit())
 }
 
 /// Push operator-set media geometry to the printer as a synthetic material
@@ -453,12 +487,13 @@ async fn apply_media(
         .map_err(|e| format!("cannot read the loaded material: {e}"))?;
 
     if let Some(ref m) = current
-        && !tag_is_blank(&m.uuid)
+        && !record_is_ours(&m.uuid, &m.code)
     {
         return Err(format!(
-            "a genuine RFID roll is loaded (UUID {}, {}x{}mm) and describes itself — \
-             its own geometry is authoritative. Only unreadable or blank stock can be set here.",
-            m.uuid, m.width_mm, m.height_mm
+            "a genuine RFID roll is loaded (UUID {}, signature {}, {}x{}mm) and describes \
+             itself — its own geometry is authoritative. Only blank stock, or a record this \
+             app wrote, can be set here.",
+            m.uuid, m.code, m.width_mm, m.height_mm
         ));
     }
 
@@ -539,19 +574,25 @@ fn prune_stale_supvan(registry: &PrinterRegistry) {
 mod tests {
     use super::*;
 
-    /// The blank-tag test is the whole safety gate: a genuine roll must never
-    /// be classified as blank, or `apply_media` would overwrite a tag that
-    /// describes itself. Mirrors the vendor's `UUID.indexOf("00000000") == -1`.
+    /// The ownership test is the whole safety gate. It has to say yes to blank
+    /// stock and to records we wrote — otherwise a roll could be set once and
+    /// never corrected — while still refusing a genuine signed consumable.
     #[test]
-    fn blank_tag_detection_matches_the_vendor_gate() {
-        assert!(tag_is_blank("00000000000000"), "all-zero is blank");
-        assert!(tag_is_blank(""), "absent is blank");
+    fn ownership_gate_protects_only_genuine_tags() {
+        // Blank stock.
+        assert!(record_is_ours("00000000000000", "0000000000000000"));
+        assert!(record_is_ours("", ""));
 
-        assert!(!tag_is_blank("30000000000000"), "our synthetic code");
-        assert!(!tag_is_blank("56180000000000"), "two-colour catalogue code");
+        // Records we wrote: a synthetic UUID, but never a signature. Observed
+        // live on a T50M Pro after `provision --code 30000`.
+        assert!(record_is_ours("30000000000000", "0000000000000000"));
+        assert!(record_is_ours("56180000000000", "0000000000000000"));
+
+        // A genuine consumable carries a signature — the one case to refuse.
+        assert!(!record_is_ours("A1B2C3D4E5F607", "1122334455667788"));
         assert!(
-            !tag_is_blank("0000000000000A"),
-            "one non-zero nibble is enough"
+            !record_is_ours("00000000000000", "0000000000000001"),
+            "a signature alone is enough to mean hands off"
         );
     }
 
