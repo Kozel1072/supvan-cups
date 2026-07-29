@@ -159,6 +159,58 @@ impl Printer {
         Ok(())
     }
 
+    /// Write a material record and confirm the printer took it, returning the
+    /// material as read back.
+    ///
+    /// The commit is asynchronous: for a short window after the bulk write the
+    /// printer still serves a half-updated record (observed on a T50M Pro as a
+    /// UUID of `00001000000000`, between the old all-zero value and the new
+    /// one), so a single read straight after the write reports a false failure.
+    /// Poll until the synthetic UUID echoes back.
+    pub async fn provision_material(
+        &self,
+        mat: &crate::rfid::RfidMaterial,
+    ) -> Result<MaterialInfo> {
+        /// ~2s total, comfortably past the observed few-hundred-ms window.
+        const SETTLE_POLLS: usize = 10;
+        const SETTLE_INTERVAL: Duration = Duration::from_millis(200);
+
+        self.set_rfid_data(&mat.encode()).await?;
+
+        let expected: String = mat
+            .uuid_bytes()
+            .iter()
+            .map(|b| format!("{b:02X}"))
+            .collect();
+        let mut last = None;
+        for _ in 0..SETTLE_POLLS {
+            tokio::time::sleep(SETTLE_INTERVAL).await;
+            match self.query_material().await? {
+                Some(m) if m.uuid == expected => {
+                    log::info!(
+                        "provisioned: {}x{}mm gap={}mm heat={}/{} uuid={}",
+                        m.width_mm,
+                        m.height_mm,
+                        m.gap_mm,
+                        mat.heat_time_5,
+                        mat.heat_time_40,
+                        m.uuid
+                    );
+                    return Ok(m);
+                }
+                other => last = other,
+            }
+        }
+
+        Err(Error::InvalidResponse(match last {
+            Some(m) => format!(
+                "record not taken: printer reports UUID {} (wrote {expected})",
+                m.uuid
+            ),
+            None => "record not taken: no material info after write".into(),
+        }))
+    }
+
     /// Send an arbitrary opcode and hand back the raw response, for probing
     /// commands whose frame shape we don't know yet.
     ///

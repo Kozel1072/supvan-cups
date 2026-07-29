@@ -10,7 +10,6 @@
 
 use std::error::Error;
 use std::process::ExitCode;
-use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use supvan_proto::bitmap::{
@@ -376,47 +375,23 @@ fn build_material(
     }
 }
 
-/// The printer commits a written record asynchronously: for a short window
-/// after the bulk write it still serves a half-updated one (observed on a T50M
-/// Pro as a UUID of `00001000000000` between the old all-zero value and the new
-/// one). Poll rather than trusting the first read.
-const PROVISION_SETTLE_POLLS: usize = 10;
-const PROVISION_SETTLE_INTERVAL: Duration = Duration::from_millis(200);
-
-/// Write the record, then read the material back so the caller can see whether
-/// the printer actually took it — the synthetic UUID echoing back is the tell.
+/// Write the record and report whether the printer took it. The write-then-
+/// settle-poll dance lives in `Printer::provision_material`, shared with the
+/// IPP app.
 async fn provision(printer: &Printer, mat: &RfidMaterial) -> Result<(), Box<dyn Error>> {
-    printer.set_rfid_data(&mat.encode()).await?;
-
-    let expected = hex_upper(&mat.uuid_bytes());
-    let mut last = None;
-    for _ in 0..PROVISION_SETTLE_POLLS {
-        tokio::time::sleep(PROVISION_SETTLE_INTERVAL).await;
-        let read_back = printer.query_material().await?;
-        if let Some(ref m) = read_back
-            && m.uuid == expected
-        {
+    match printer.provision_material(mat).await {
+        Ok(m) => {
             eprintln!(
                 "Provisioned: {}mm x {}mm, gap {}mm, heat {}/{}, UUID {}",
                 m.width_mm, m.height_mm, m.gap_mm, mat.heat_time_5, mat.heat_time_40, m.uuid
             );
-            return Ok(());
+            Ok(())
         }
-        last = read_back;
+        Err(e) => {
+            eprintln!("Warning: {e}");
+            Ok(())
+        }
     }
-
-    match last {
-        Some(m) => eprintln!(
-            "Warning: printer still reports UUID {} (wrote {expected}) — record not taken",
-            m.uuid
-        ),
-        None => eprintln!("Warning: no material info after write"),
-    }
-    Ok(())
-}
-
-fn hex_upper(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02X}")).collect()
 }
 
 async fn cmd_provision(
@@ -645,7 +620,9 @@ async fn cmd_paper_back(target: &str, param: u16) -> CliResult {
                 eprintln!("Identical to an unallocated opcode: NOT implemented, nothing moved.");
             } else {
                 eprintln!("PAPER_BACK -> {h:02x?}");
-                eprintln!("Differs from the unallocated baseline — the firmware knows this opcode.");
+                eprintln!(
+                    "Differs from the unallocated baseline — the firmware knows this opcode."
+                );
             }
         }
     }
