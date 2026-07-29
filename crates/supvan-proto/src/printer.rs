@@ -130,6 +130,34 @@ impl Printer {
         }
     }
 
+    /// Push a synthetic label-material record, standing in for the RFID tag
+    /// third-party stock doesn't have. Clears `label_rw_error` and gives the
+    /// firmware the geometry and heat times to print with.
+    ///
+    /// Two-step, mirroring `t5080PrintUtils.setDivRfidData()`: announce the
+    /// payload length under 0x5D, then bulk-write the record. The vendor's
+    /// `CMD_SET_RFID_DATA_WRITE: 999` is an internal step marker, not a second
+    /// opcode — nothing by that name goes on the wire.
+    ///
+    /// Only meaningful on blank stock. Genuine consumables carry a real tag and
+    /// the vendor deliberately skips this for them; overwriting one is not
+    /// something the protocol offers a way back from.
+    pub async fn set_rfid_data(&self, record: &[u8]) -> Result<()> {
+        let len = u16::try_from(record.len())
+            .map_err(|_| Error::InvalidParam(format!("RFID record too long: {}", record.len())))?;
+        log::info!("SET_RFID_DATA: {len} bytes");
+
+        let resp = self.transport.send_cmd(CMD_SET_RFID_DATA, len).await?;
+        if !resp.is_some_and(|r| self.transport.validate_response(&r, CMD_SET_RFID_DATA)) {
+            return Err(Error::InvalidResponse("SET_RFID_DATA: no ack".into()));
+        }
+
+        // Unlike the print path, the vendor does read a response after the last
+        // frame here: there is no BUF_FULL to ack the transfer instead.
+        self.transport.send_bulk_data(record, true).await?;
+        Ok(())
+    }
+
     /// Wait for device to be idle (not busy, not printing).
     pub async fn wait_ready(&self, max_attempts: usize) -> Result<Option<PrinterStatus>> {
         for _ in 0..max_attempts {
