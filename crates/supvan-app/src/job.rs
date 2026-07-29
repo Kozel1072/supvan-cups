@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use ipp_printer_app::{JobFailure, JobOptions, PrinterHandle, PrinterReason, RasterDriver};
 use supvan_proto::bitmap::{DEFAULT_MARGIN_DOTS, center_in_printhead, raster_to_column_major};
-use supvan_proto::buffer::{Density, split_into_buffers};
+use supvan_proto::buffer::{ColourMode, Density, split_into_buffers};
 use supvan_proto::compress::compress_buffers;
 use supvan_proto::error::Error as ProtoError;
 use supvan_proto::speed::calc_speed;
@@ -160,6 +160,7 @@ impl KsJob {
             // IPP carries one print-quality knob, so both trims move together —
             // the vendor's own behaviour when its packed density fits in a byte.
             Density::uniform(self.density),
+            ColourMode::Mono,
         );
 
         let (compressed, avg) = compress_buffers(&buffers)

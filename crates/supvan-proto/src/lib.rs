@@ -26,4 +26,5 @@ pub mod speed;
 pub mod spp_pipe;
 pub mod status;
 pub mod transport;
+pub mod twocolor;
 pub mod usb_transport;

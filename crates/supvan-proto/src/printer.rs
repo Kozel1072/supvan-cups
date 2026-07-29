@@ -4,7 +4,7 @@
 //! CHECK_DEVICE -> poll ready -> START_PRINT -> poll printing ->
 //! transfer buffers -> poll complete.
 
-use crate::buffer::Density;
+use crate::buffer::{ColourMode, Density};
 use crate::cmd::*;
 use crate::data::DATA_PAYLOAD_SIZE;
 use crate::error::{Error, Result};
@@ -356,7 +356,15 @@ impl Printer {
         );
 
         let (image_data, _w, h, bpl) = create_test_pattern(label_width_mm, height_mm);
-        let buffers = split_into_buffers(&image_data, bpl as u8, h as u16, 8, 8, density);
+        let buffers = split_into_buffers(
+            &image_data,
+            bpl as u8,
+            h as u16,
+            8,
+            8,
+            density,
+            ColourMode::Mono,
+        );
         log::info!("{} print buffers", buffers.len());
 
         let (compressed, avg) = compress_buffers(&buffers)?;
@@ -408,7 +416,14 @@ impl Printer {
             })
             .collect();
         let margin = crate::bitmap::DEFAULT_MARGIN_DOTS;
-        let buffers = split_into_banded_buffers(&image_data, bpl as u8, &bands, margin, margin);
+        let buffers = split_into_banded_buffers(
+            &image_data,
+            bpl as u8,
+            &bands,
+            margin,
+            margin,
+            ColourMode::Mono,
+        );
         log::info!(
             "swatch ladder: {}mm x {}mm, {} bands of {} cols, densities={:?}",
             label_width_mm,
@@ -416,6 +431,74 @@ impl Printer {
             steps,
             band_cols,
             densities
+        );
+
+        let (compressed, avg) = compress_buffers(&buffers)?;
+        let speed = calc_speed(avg);
+        self.print_compressed(&compressed, speed).await
+    }
+
+    /// Print an RGB image in two-colour mode, red and black on one pass.
+    ///
+    /// `rgb` is row-major `width * height * 3`. Pixels are sorted into the two
+    /// planes by luminance ([`crate::twocolor::classify`]) — a cut, not a hue
+    /// test, so quantise to two ink colours first rather than feeding a
+    /// photograph.
+    ///
+    /// `density.red` and `density.black` trim the two planes independently.
+    ///
+    /// Whether a given unit honours this is not guaranteed: the vendor's own
+    /// capability check excludes T50 Pro units whose Bluetooth name contains
+    /// `A` or `B`, and the shipped app never enables the path at all.
+    pub async fn print_two_colour(
+        &self,
+        rgb: &[u8],
+        width: u32,
+        height: u32,
+        density: Density,
+    ) -> Result<()> {
+        use crate::buffer::{DensityBand, split_into_banded_buffers};
+        use crate::compress::compress_buffers;
+        use crate::twocolor::{interleave_planes, rgb_to_planes};
+
+        let expected = (width as usize) * (height as usize) * 3;
+        if rgb.len() < expected {
+            return Err(Error::InvalidParam(format!(
+                "RGB buffer too small: {} < {expected}",
+                rgb.len()
+            )));
+        }
+
+        let (red, black, cols, bpl) = rgb_to_planes(rgb, width, height);
+        let interleaved = interleave_planes(&red, &black, bpl as usize, cols as usize)
+            .ok_or_else(|| Error::InvalidParam("plane interleave failed".into()))?;
+
+        let margin = crate::bitmap::DEFAULT_MARGIN_DOTS;
+        let printable = (cols as u16).saturating_sub(2 * margin);
+        if printable == 0 {
+            return Err(Error::InvalidParam(format!(
+                "{height} rows leaves nothing after margins"
+            )));
+        }
+
+        let bands = [DensityBand {
+            cols: printable,
+            density,
+        }];
+        let buffers = split_into_banded_buffers(
+            &interleaved,
+            bpl as u8,
+            &bands,
+            margin,
+            margin,
+            ColourMode::TwoColour,
+        );
+        log::info!(
+            "two-colour: {width}x{height}, {} cols, black={} red={}, {} buffers",
+            printable,
+            density.black,
+            density.red,
+            buffers.len()
         );
 
         let (compressed, avg) = compress_buffers(&buffers)?;

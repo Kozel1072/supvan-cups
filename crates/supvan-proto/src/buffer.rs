@@ -99,10 +99,43 @@ impl Default for Density {
     }
 }
 
+/// How many bitplanes each printed column carries.
+///
+/// [`TwoColour`](ColourMode::TwoColour) doubles the data: every column ships a
+/// red line followed by a black line (see [`crate::twocolor`]). The firmware is
+/// told via the `first_cut` field and a doubled column count, so `cols_in_buf`
+/// must already be the doubled figure.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ColourMode {
+    #[default]
+    Mono,
+    TwoColour,
+}
+
+impl ColourMode {
+    /// The `first_cut` value that selects this mode. The vendor sets 2 for
+    /// two-colour (`i2 == 3` branch in `T50PlusPrint`); mono leaves it 0.
+    fn first_cut(self) -> u8 {
+        match self {
+            Self::Mono => 0,
+            Self::TwoColour => 2,
+        }
+    }
+
+    /// Bitplanes per printed column.
+    pub fn planes(self) -> u16 {
+        match self {
+            Self::Mono => 1,
+            Self::TwoColour => 2,
+        }
+    }
+}
+
 /// Parameters for building a print buffer.
 pub struct PrintBufferParams<'a> {
     pub image_data: &'a [u8],
     pub per_line_byte: u8,
+    /// Lines in this buffer — already doubled when `colour` is two-colour.
     pub cols_in_buf: u16,
     pub page_st: bool,
     pub page_end: bool,
@@ -110,6 +143,7 @@ pub struct PrintBufferParams<'a> {
     pub margin_top: u16,
     pub margin_bottom: u16,
     pub density: Density,
+    pub colour: ColourMode,
 }
 
 /// Build a 4096-byte print buffer.
@@ -135,6 +169,7 @@ pub fn build_print_buffer(p: &PrintBufferParams) -> [u8; PRINT_BUF_SIZE] {
         prt_end: p.prt_end,
         nodu: p.density.black,
         mat: 1,
+        first_cut: p.colour.first_cut(),
         ..Default::default()
     });
     buf[2] = page_bits[0];
@@ -177,9 +212,9 @@ pub fn build_print_buffer(p: &PrintBufferParams) -> [u8; PRINT_BUF_SIZE] {
 /// A run of feed-direction columns printed at its own density.
 ///
 /// Density is a per-buffer field, and buffers tile the label along the feed
-/// axis, so energy can vary from one stripe of the label to the next — but
-/// never within a printhead line. That is the whole extent of the protocol's
-/// per-area energy control; there is no per-dot equivalent.
+/// axis, so energy can vary from one stripe of the label to the next. Within a
+/// printhead line it cannot — except by colour: see [`ColourMode::TwoColour`],
+/// which splits each line into two independently-trimmed planes.
 #[derive(Debug, Clone, Copy)]
 pub struct DensityBand {
     pub cols: u16,
@@ -196,6 +231,7 @@ pub fn split_into_buffers(
     margin_top: u16,
     margin_bottom: u16,
     density: Density,
+    colour: ColourMode,
 ) -> Vec<[u8; PRINT_BUF_SIZE]> {
     let cols = total_cols - margin_top - margin_bottom;
     split_into_banded_buffers(
@@ -204,20 +240,28 @@ pub fn split_into_buffers(
         &[DensityBand { cols, density }],
         margin_top,
         margin_bottom,
+        colour,
     )
 }
 
 /// Split column-major image data into print buffers, giving each band its own
 /// density. Bands are laid down the feed direction in order; a band larger than
 /// one buffer's capacity is split across several, all keeping its density.
+///
+/// `cols` throughout is counted in *printed* columns (printhead lines). Under
+/// [`ColourMode::TwoColour`] each of those costs two `per_line_byte` planes, so
+/// buffer capacity halves and the header advertises twice the count.
 pub fn split_into_banded_buffers(
     image_data: &[u8],
     per_line_byte: u8,
     bands: &[DensityBand],
     margin_top: u16,
     margin_bottom: u16,
+    colour: ColourMode,
 ) -> Vec<[u8; PRINT_BUF_SIZE]> {
-    let max_cols = (MAX_BUF_DATA / per_line_byte as usize) as u16;
+    let planes = colour.planes();
+    let col_stride = per_line_byte as usize * planes as usize;
+    let max_cols = (MAX_BUF_DATA / col_stride) as u16;
 
     // Resolve the full chunk list up front: page_end/prt_end must be set on the
     // final buffer, which isn't known until every band has been tiled.
@@ -238,8 +282,8 @@ pub fn split_into_banded_buffers(
         .iter()
         .enumerate()
         .map(|(i, &(start_col, cols_in_buf, density))| {
-            let img_start = (margin_top + start_col) as usize * per_line_byte as usize;
-            let img_end = img_start + cols_in_buf as usize * per_line_byte as usize;
+            let img_start = (margin_top + start_col) as usize * col_stride;
+            let img_end = img_start + cols_in_buf as usize * col_stride;
             let img_chunk = image_data
                 .get(img_start..img_end.min(image_data.len()))
                 .unwrap_or(&[]);
@@ -247,13 +291,14 @@ pub fn split_into_banded_buffers(
             build_print_buffer(&PrintBufferParams {
                 image_data: img_chunk,
                 per_line_byte,
-                cols_in_buf,
+                cols_in_buf: cols_in_buf * planes,
                 page_st: i == 0,
                 page_end: i == last,
                 prt_end: i == last,
                 margin_top,
                 margin_bottom,
                 density,
+                colour,
             })
         })
         .collect()
@@ -304,6 +349,7 @@ mod tests {
             margin_top: 8,
             margin_bottom: 8,
             density: Density::uniform(4),
+            colour: ColourMode::Mono,
         });
         // Verify buffer structure
         assert_eq!(buf[6], 48); // bytes per line
@@ -331,6 +377,7 @@ mod tests {
             8,
             8,
             Density::uniform(4),
+            ColourMode::Mono,
         );
         assert_eq!(bufs.len(), 3);
     }
@@ -355,7 +402,8 @@ mod tests {
                 density: Density::uniform(15),
             },
         ];
-        let bufs = split_into_banded_buffers(&image_data, per_line_byte, &bands, 8, 8);
+        let bufs =
+            split_into_banded_buffers(&image_data, per_line_byte, &bands, 8, 8, ColourMode::Mono);
 
         assert_eq!(bufs.len(), 3);
         assert_eq!([bufs[0][12], bufs[1][12], bufs[2][12]], [2, 9, 15]);
@@ -374,7 +422,8 @@ mod tests {
             cols: 200,
             density: Density::uniform(7),
         }];
-        let bufs = split_into_banded_buffers(&image_data, per_line_byte, &bands, 8, 8);
+        let bufs =
+            split_into_banded_buffers(&image_data, per_line_byte, &bands, 8, 8, ColourMode::Mono);
 
         assert_eq!(bufs.len(), 3); // 84 + 84 + 32
         assert!(bufs.iter().all(|b| b[12] == 7));
@@ -397,9 +446,66 @@ mod tests {
             margin_top: 8,
             margin_bottom: 8,
             density: Density { black: 3, red: 12 },
+            colour: ColourMode::Mono,
         });
         assert_eq!(buf[12], 12); // red deepness
         assert_eq!((buf[3] >> 2) & 0x0F, 3); // nodu = black
+    }
+
+    /// Two-colour advertises twice the printed columns and sets first_cut=2;
+    /// mono touches neither. Both are how the firmware tells the modes apart.
+    #[test]
+    fn two_colour_doubles_columns_and_flags_first_cut() {
+        let per_line_byte = 48u8;
+        let cols = 40u16;
+        // Two planes per column, so twice the image bytes.
+        let image_data = vec![0u8; (cols as usize + 8) * per_line_byte as usize * 2];
+        let bands = [DensityBand {
+            cols,
+            density: Density { black: 5, red: 9 },
+        }];
+
+        let two = split_into_banded_buffers(
+            &image_data,
+            per_line_byte,
+            &bands,
+            8,
+            8,
+            ColourMode::TwoColour,
+        );
+        assert_eq!(u16::from_le_bytes([two[0][4], two[0][5]]), cols * 2);
+        assert_eq!(two[0][3] & 0x03, 2); // first_cut
+        assert_eq!(two[0][12], 9); // red trim survives
+        assert_eq!((two[0][3] >> 2) & 0x0F, 5); // black trim survives
+
+        let mono =
+            split_into_banded_buffers(&image_data, per_line_byte, &bands, 8, 8, ColourMode::Mono);
+        assert_eq!(u16::from_le_bytes([mono[0][4], mono[0][5]]), cols);
+        assert_eq!(mono[0][3] & 0x03, 0);
+    }
+
+    /// Each column costs two planes, so a buffer holds half as many of them.
+    #[test]
+    fn two_colour_halves_buffer_capacity() {
+        let per_line_byte = 48u8; // mono max_cols = 4074/48 = 84 → two-colour 42
+        let cols = 100u16;
+        let image_data = vec![0u8; (cols as usize + 16) * per_line_byte as usize * 2];
+        let bands = [DensityBand {
+            cols,
+            density: Density::uniform(4),
+        }];
+
+        let bufs = split_into_banded_buffers(
+            &image_data,
+            per_line_byte,
+            &bands,
+            8,
+            8,
+            ColourMode::TwoColour,
+        );
+        assert_eq!(bufs.len(), 3); // 42 + 42 + 16
+        assert_eq!(u16::from_le_bytes([bufs[0][4], bufs[0][5]]), 42 * 2);
+        assert_eq!(u16::from_le_bytes([bufs[2][4], bufs[2][5]]), 16 * 2);
     }
 
     /// The single-density entry point is the banded one with one band, so the
@@ -408,7 +514,15 @@ mod tests {
     fn plain_split_matches_single_band() {
         let per_line_byte = 48u8;
         let image_data = vec![0xA5u8; 240 * per_line_byte as usize];
-        let plain = split_into_buffers(&image_data, per_line_byte, 240, 8, 8, Density::uniform(4));
+        let plain = split_into_buffers(
+            &image_data,
+            per_line_byte,
+            240,
+            8,
+            8,
+            Density::uniform(4),
+            ColourMode::Mono,
+        );
         let banded = split_into_banded_buffers(
             &image_data,
             per_line_byte,
@@ -418,6 +532,7 @@ mod tests {
             }],
             8,
             8,
+            ColourMode::Mono,
         );
         assert_eq!(plain, banded);
     }
