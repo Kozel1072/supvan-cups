@@ -256,20 +256,91 @@ the protocol. Vendor presets, selected by catalogue code:
 ### Energy control and its limits
 
 Two knobs, in series: the material record's heat times set absolute pulse width,
-and the per-buffer density (`nodu`, 0–15) trims it. Density is encoded twice in
-each print buffer — `buf[12]` and the `nodu` field of PAGE_REG_BITS — and both
-carry the same value.
+and the per-buffer density (0–15) trims it.
+
+Density is **two independent trims**, not one — `Density { black, red }`. The
+Android app keeps them as `mDeepness` / `mRedDeepness` and packs them for
+transport as `(black << 8) | red`, unpacking whenever the value exceeds 255
+(`T50PlusPrint.java:107-112`). They land in different header fields:
+
+| trim | header field |
+|------|--------------|
+| black | PAGE_REG_BITS `nodu` (byte 1, bits 2-5) |
+| red   | `buf[12]` |
 
 Because density lives in the buffer header and buffers tile the label along the
 **feed** axis, energy can differ from one printhead line to the next, down to a
-single-column buffer (0.125 mm at 8 dots/mm). It cannot differ *within* a line:
-all 384 dots across the head share one energy. `buffer::split_into_banded_buffers`
-exposes this as a list of `DensityBand`s.
+single-column buffer (0.125 mm at 8 dots/mm). Within a line it can differ only by
+*colour*, via the two-colour mode below.
+`buffer::split_into_banded_buffers` exposes the feed-axis case as a list of
+`DensityBand`s.
 
-There is no colour concept anywhere in the firmware — `PaperTypeEnum` has 16
-entries and none of them is two-colour. Energy-selected two-colour stock is
-therefore driven purely by heat time and density; `supvan-cli heat-sweep` walks
-both to find where a given roll's colour flips.
+`PaperTypeEnum` has 16 entries and none is two-colour, but that does not mean the
+firmware has no colour concept — it has a dedicated mode, described next.
+
+### Two-colour mode
+
+Two interleaved bitplanes per printhead line, each burned at its own trim, giving
+**per-dot** colour selection. Recovered from
+`ImgConverter.GetBytes(int, int, int, List<Color>)` and the `i2 == 3` branch of
+`T50PlusPrint`; implemented in `twocolor.rs` and selected by
+`buffer::ColourMode::TwoColour`.
+
+Wire differences from mono:
+
+| aspect | mono | two-colour |
+|--------|------|------------|
+| PAGE_REG_BITS `first_cut` | 0 | **2** |
+| header column count | printed columns | **printed columns × 2** |
+| bytes per column | `per_line_byte` | `per_line_byte × 2` |
+| max columns per buffer | `MAX_BUF_DATA / bpl` | **halved** |
+
+Each column ships its red line immediately followed by its black line. Pixels are
+sorted by luma `0.3 R + 0.59 G + 0.11 B`:
+
+| luma | destination |
+|------|-------------|
+| ≥ 125 | no ink |
+| 48 … 125 | plane 0 (red) |
+| ≤ 48 | plane 1 (black) |
+
+The `48` cut is placed so pure red — luma `255 × 0.3 = 76` — lands on the red
+side. It is a **luminance cut, not a hue test**: any mid-grey in the 48–125 window
+becomes red, so quantise to two ink colours before encoding rather than feeding an
+arbitrary image.
+
+**Availability is gated, and not every unit qualifies.**
+`DeviceManager.isTwoColorDevice()` returns 2 for T80 Pro / T50 Plus, and 3 for a
+T50 Pro *only* when its Bluetooth name contains neither `A` nor `B`. The shipped
+app never enables the path regardless: `PrintPageData.colors` is read but never
+populated. `MaterialManager.isTwoColorConsumable()` additionally requires a
+catalogue code in `{5602, 5618-5621, 5686-5692}` — settable via
+`supvan-cli provision --code`.
+
+**Measured on a T50M Pro (`T0117A2410211517`, USB HID): the mode is accepted but
+ignored.** The buffers are taken without error and the print completes, but a card
+of vertical red/black stripes — both colours on every printhead line, which only
+genuine two-plane support can produce — came out uniformly one colour. The
+interleave appears to be consumed as plain mono columns, rendering each stripe at
+half vertical fill (hence unusually light output). This matches
+`isTwoColorDevice()` excluding this serial. The encoder is retained for the
+hardware the vendor does list as capable.
+
+**On such a unit, colour is per-label, not per-area.** Heat time is the only
+control that moves it; the 0-15 density trim showed no discernible effect across
+its full range at the transition heats. Measured on Niimbot two-colour stock:
+
+| heat5:heat40 | result |
+|--------------|--------|
+| 300:150 | faint red |
+| **500:300** | **clean red** |
+| 700:450 | red, black appearing at band leading edges |
+| 800:500 | red + ~50% black |
+| **1700:1200** | **solid black** |
+
+Set the pair with `supvan-cli provision --heat`, or walk a range with
+`supvan-cli heat-sweep`. Darker bands at the *leading edge* of each printed run
+are a printhead history-compensation artefact, not a density effect.
 
 **No host-commanded backfeed.** `PAPER_SKIP` (0x2E) feeds forward only and the
 Linux editor never sends it. The editor's 标签对齐 ("label align") button is
@@ -278,6 +349,32 @@ a host-side resume index for a paused queue, not paper motion. The `Savepaper`
 bit and 2-bit `Cut` field in PAGE_REG_BITS are defined but never set by the
 vendor; their behaviour is unknown. So a true two-pass over one label has no
 documented path.
+
+### Grayscale: there is none
+
+The raster is strictly 1bpp. Two-colour doubles the *planes*, not the bit depth,
+and there is no 4bpp analogue anywhere in the format. Every intermediate tone is a
+host-side halftone.
+
+The vendor does this in `BitmapUtil` — Floyd–Steinberg, Atkinson, Bayer, Stucki,
+and `convertTo16GrayWithDithering`, which quantises to 16 levels
+(`GRAY_16_LUT = i * 17`) and then relies on `ImgConverter`'s threshold of 125 to
+get back to 1bpp — with a `ditherSwitch` in its print-setup UI.
+
+We halftone in `dither::Ditherer`, selected by `SUPVAN_DITHER` for the IPP app or
+`--dither` on `supvan-cli gray-ramp`:
+
+| mode | notes |
+|------|-------|
+| `bayer` | 4×4 ordered, stateless. **Default** — `SRGB_TO_LINEAR` compensates this hardware's dot spread |
+| `floyd-steinberg` | 7/16, 3/16, 5/16, 1/16 |
+| `atkinson` | spreads 6/8, higher local contrast |
+| `vendor16` | the vendor pipeline reproduced: 16-level quantise + their kernel + threshold 125 |
+
+`vendor16` deliberately skips `SRGB_TO_LINEAR` — the vendor applies no thermal
+compensation, and adding ours would stop it being their pipeline. Their weights
+(0.3125, 0.1875, 0.375, 0.0625) sum to 15/16 rather than 1, dropping a little
+error per pixel; reproduced as-is.
 
 **Status flag — `FirmwareNeedUpgrade`.** The Linux tool decodes a "firmware
 needs upgrade" flag from status byte `[3] & 0x20` (G-series `gPrintFlag.js`) —

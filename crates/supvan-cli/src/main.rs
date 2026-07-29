@@ -4,8 +4,9 @@
 //! version), `material` (loaded label + RFID + remaining count), `test-print`
 //! (a built-in pattern), `feed` (advance one label), `provision` (inject a
 //! synthetic material record for stock the printer can't read a tag from),
-//! `heat-sweep` (walk heat time against density to calibrate unknown stock), or
-//! `discover` (scan for Supvan Bluetooth devices).
+//! `heat-sweep` (walk heat time against density to calibrate unknown stock),
+//! `two-color` (test the per-dot red/black mode), `gray-ramp` (compare halftone
+//! kernels), or `discover` (scan for Supvan Bluetooth devices).
 
 use std::error::Error;
 use std::process::ExitCode;
