@@ -8,6 +8,7 @@ use ipp_printer_app::{
     PrinterReason, PrinterRegistry, ReadyMedia, Server, ServerOptions, default_state_path,
 };
 use parking_lot::RwLock;
+use supvan_proto::rfid::{RfidMaterial, heat_presets};
 
 use crate::ble_discover::BleCandidate;
 use crate::discover::BtCandidate;
@@ -93,7 +94,11 @@ impl DeviceBackend for SupvanDeviceBackend {
         // was busy and RETURN_MAT didn't reply), fall back to its bus URI
         // as the group key. A final 1-USB-only + 1-BT-only sweep merges
         // them under the BT name to keep single-printer households tidy.
-        type Group = (Option<UsbCandidate>, Option<BtCandidate>, Option<BleCandidate>);
+        type Group = (
+            Option<UsbCandidate>,
+            Option<BtCandidate>,
+            Option<BleCandidate>,
+        );
         let mut by_name: BTreeMap<String, Group> = BTreeMap::new();
         for u in usb {
             let key = u.printer_name.clone().unwrap_or_else(|| u.uri_id.clone());
@@ -346,11 +351,9 @@ pub async fn run_server(host: &str, port: u16) -> std::io::Result<()> {
                     // the framework retry until it's resolved, not drop it (the way
                     // a real printer holds a job through a jam). Anything else is a
                     // permanent failure for this document.
-                    Err(f) if f.printer_reasons.is_recoverable() => {
-                        JobOutcome::DeviceUnavailable {
-                            reasons: f.printer_reasons,
-                        }
-                    }
+                    Err(f) if f.printer_reasons.is_recoverable() => JobOutcome::DeviceUnavailable {
+                        reasons: f.printer_reasons,
+                    },
                     Err(f) => JobOutcome::Failed(f),
                 }
             })
@@ -364,18 +367,156 @@ pub async fn run_server(host: &str, port: u16) -> std::io::Result<()> {
     // for an AirPrint printer. This requires `cups-browsed` to be off — it
     // would otherwise build a broken same-host `implicitclass://` queue from
     // our advert (it's legacy; modern cupsd does driverless natively).
+    let registry_media = registry.clone();
+    let media_change: ipp_printer_app::MediaChangeFn = Arc::new(
+        move |printer_name: String, media: ipp_printer_app::ReadyMedia| {
+            let registry_media = registry_media.clone();
+            Box::pin(async move {
+                let device_uri = {
+                    let guard = registry_media.read();
+                    guard
+                        .iter()
+                        .find(|p| p.config.name == printer_name)
+                        .map(|p| p.config.device_uri.clone())
+                        .ok_or_else(|| format!("no printer named {printer_name}"))?
+                };
+                apply_media(&printer_name, &device_uri, &media).await
+            })
+        },
+    );
+
     Server::run(ServerOptions {
         host: host.to_string(),
         port,
         printers: registry,
         device_backend: backend,
         print_job,
+        media_change: Some(media_change),
         state_path,
         // Advertise the DNS-SD service directly at bind time. No queue UUID to
         // stamp (we own no queue), so there's nothing to coordinate first.
         advertise_mdns: true,
     })
     .await
+}
+
+/// Heat times to write when provisioning, from `SUPVAN_HEAT` as `heat5:heat40`.
+///
+/// The material record carries heat but `RETURN_MAT` never returns it
+/// (`MaterialInfo` has no such field), so we cannot preserve what is already on
+/// the roll — a provision necessarily sets it. Taking it from the environment
+/// keeps that an explicit choice rather than a silent reset, and matches how the
+/// app takes the rest of its configuration.
+fn configured_heat() -> (u16, u16) {
+    let Ok(raw) = std::env::var("SUPVAN_HEAT") else {
+        return heat_presets::STANDARD;
+    };
+    let parsed = raw
+        .split_once(':')
+        .and_then(|(a, b)| Some((a.trim().parse().ok()?, b.trim().parse().ok()?)));
+    parsed.unwrap_or_else(|| {
+        log::warn!("SUPVAN_HEAT: expected `heat5:heat40`, got {raw:?}; using the standard profile");
+        heat_presets::STANDARD
+    })
+}
+
+/// True when the printer read back no usable tag — the vendor's own test, which
+/// its editor spells `UUID.indexOf("00000000") == -1`.
+fn tag_is_blank(uuid: &str) -> bool {
+    uuid.is_empty() || uuid.chars().all(|c| c == '0')
+}
+
+/// Push operator-set media geometry to the printer as a synthetic material
+/// record.
+///
+/// **Refuses when a genuine RFID tag is present.** A real consumable describes
+/// itself, and that description is what `RETURN_MAT` feeds into `media-ready`,
+/// the remaining-labels gauge and roll-swap detection. Overwriting it would
+/// replace measured truth with a typed-in guess, and 0x5D offers no way back.
+/// Only blank stock — which reads as an all-zero UUID — is ours to define.
+async fn apply_media(
+    printer_name: &str,
+    device_uri: &str,
+    media: &ipp_printer_app::ReadyMedia,
+) -> Result<(), String> {
+    let dev = crate::device::open_uri(device_uri)
+        .await
+        .ok_or_else(|| format!("cannot reach {device_uri}"))?;
+    let printer = dev
+        .printer
+        .as_ref()
+        .ok_or("mock device: nothing to provision")?;
+
+    let current = printer
+        .query_material()
+        .await
+        .map_err(|e| format!("cannot read the loaded material: {e}"))?;
+
+    if let Some(ref m) = current
+        && !tag_is_blank(&m.uuid)
+    {
+        return Err(format!(
+            "a genuine RFID roll is loaded (UUID {}, {}x{}mm) and describes itself — \
+             its own geometry is authoritative. Only unreadable or blank stock can be set here.",
+            m.uuid, m.width_mm, m.height_mm
+        ));
+    }
+
+    let (width_mm, height_mm) = (
+        (media.size_hmm[0] / 100) as u8,
+        (media.size_hmm[1] / 100) as u8,
+    );
+    if current
+        .as_ref()
+        .is_some_and(|m| m.width_mm == width_mm && m.height_mm == height_mm)
+    {
+        log::info!("{printer_name}: media already {width_mm}x{height_mm}mm, not rewriting");
+        return Ok(());
+    }
+
+    // Carry over everything the read *does* expose, so setting a size doesn't
+    // quietly discard the rest of the record.
+    let heat = configured_heat();
+    let mut mat = RfidMaterial {
+        width_mm,
+        length_mm: height_mm,
+        heat_time_5: heat.0,
+        heat_time_40: heat.1,
+        ..Default::default()
+    };
+    if let Some(ref m) = current {
+        if m.gap_mm > 0 {
+            mat.gap_mm = m.gap_mm;
+        }
+        if m.label_type > 0 {
+            mat.mat_type = m.label_type;
+        }
+    }
+
+    let written = printer
+        .provision_material(&mat)
+        .await
+        .map_err(|e| format!("the printer did not take the record: {e}"))?;
+
+    // Record the fingerprint we just wrote, so the status poller doesn't report
+    // our own change as an operator swapping the roll.
+    roll_cache().lock().unwrap().insert(
+        printer_name.to_string(),
+        RollFingerprint {
+            uuid: written.uuid.clone(),
+            code: written.code.clone(),
+            width_mm: written.width_mm,
+            height_mm: written.height_mm,
+        },
+    );
+    log::info!(
+        "{printer_name}: media set to {}x{}mm, heat {}/{}",
+        written.width_mm,
+        written.height_mm,
+        heat.0,
+        heat.1
+    );
+    Ok(())
 }
 
 /// Drop persisted entries whose URI scheme this build no longer recognises
@@ -392,4 +533,51 @@ fn prune_stale_supvan(registry: &PrinterRegistry) {
         }
         keep
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The blank-tag test is the whole safety gate: a genuine roll must never
+    /// be classified as blank, or `apply_media` would overwrite a tag that
+    /// describes itself. Mirrors the vendor's `UUID.indexOf("00000000") == -1`.
+    #[test]
+    fn blank_tag_detection_matches_the_vendor_gate() {
+        assert!(tag_is_blank("00000000000000"), "all-zero is blank");
+        assert!(tag_is_blank(""), "absent is blank");
+
+        assert!(!tag_is_blank("30000000000000"), "our synthetic code");
+        assert!(!tag_is_blank("56180000000000"), "two-colour catalogue code");
+        assert!(
+            !tag_is_blank("0000000000000A"),
+            "one non-zero nibble is enough"
+        );
+    }
+
+    /// Heat is unreadable from the device, so a bad `SUPVAN_HEAT` must fall back
+    /// rather than fail a media change — and must never silently yield 0/0,
+    /// which would print nothing at all.
+    #[test]
+    fn heat_config_falls_back_on_junk() {
+        // Serialised via a mutex-free approach: set, read, restore, since env is
+        // process-global and other tests may run in parallel.
+        let restore = std::env::var("SUPVAN_HEAT").ok();
+
+        unsafe { std::env::set_var("SUPVAN_HEAT", "1700:1200") };
+        assert_eq!(configured_heat(), (1700, 1200));
+
+        unsafe { std::env::set_var("SUPVAN_HEAT", "nonsense") };
+        assert_eq!(configured_heat(), heat_presets::STANDARD);
+
+        unsafe { std::env::set_var("SUPVAN_HEAT", "1700") };
+        assert_eq!(configured_heat(), heat_presets::STANDARD);
+
+        unsafe { std::env::remove_var("SUPVAN_HEAT") };
+        assert_eq!(configured_heat(), heat_presets::STANDARD);
+
+        if let Some(v) = restore {
+            unsafe { std::env::set_var("SUPVAN_HEAT", v) };
+        }
+    }
 }

@@ -14,6 +14,11 @@ use crate::models;
 /// Printhead resolution in dots per millimetre (matches supvan-proto).
 const DOTS_PER_MM: i32 = 8;
 
+/// Smallest label we advertise. Below roughly this the gap sensor can't
+/// reliably find the die-cut, so offering smaller would promise more than the
+/// hardware delivers.
+const MIN_LABEL_MM: i32 = 10;
+
 /// Run a full CUPS raster document through [`KsJob`]. Runs on the caller's
 /// tokio runtime (the framework's print worker) — no nested runtime.
 pub async fn run_cups_raster_job(
@@ -127,6 +132,9 @@ fn job_record(
         printhead_width_dots,
         media_names: vec![],
         media_sizes: vec![],
+        // Throwaway record: only darkness and printhead width are read from it.
+        media_size_min: [0, 0],
+        media_size_max: [0, 0],
         darkness,
         document_formats: vec![],
     })
@@ -259,6 +267,15 @@ pub fn config_from_family(
         printhead_width_dots: family.printhead_width_dots,
         media_names,
         media_sizes: family.media_sizes.clone(),
+        // Custom-size bounds, so a print dialog can offer sizes the family
+        // table doesn't enumerate. The ceiling is the material record's own
+        // clamp (`rfid::MAX_LABEL_*`) rather than a separate number, so the two
+        // cannot drift apart and advertise a size the record would truncate.
+        media_size_min: [MIN_LABEL_MM * 100, MIN_LABEL_MM * 100],
+        media_size_max: [
+            supvan_proto::rfid::MAX_LABEL_WIDTH_MM as i32 * 100,
+            supvan_proto::rfid::MAX_LABEL_LENGTH_MM as i32 * 100,
+        ],
         darkness: 50,
         // We accept PWG/CUPS raster (CUPS' driverless path) and decode
         // image/jpeg ourselves (run_jpeg_job) — the last IPP Everywhere

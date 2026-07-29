@@ -37,6 +37,17 @@ impl PrinterHandle {
         }
     }
 
+    /// Write a material record and confirm the printer took it.
+    pub async fn provision_material(
+        &self,
+        mat: &supvan_proto::rfid::RfidMaterial,
+    ) -> ProtoResult<supvan_proto::status::MaterialInfo> {
+        match self {
+            Self::Owned(p) => p.provision_material(mat).await,
+            Self::Shared(arc) => arc.lock().await.provision_material(mat).await,
+        }
+    }
+
     /// Stream the compressed raster + speed to the device.
     pub async fn print_compressed(&self, compressed: &[u8], speed: u16) -> ProtoResult<()> {
         match self {
