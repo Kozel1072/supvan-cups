@@ -143,6 +143,22 @@ impl ColourMode {
     }
 }
 
+/// Page-level flags shared by every buffer of a page.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PageOptions {
+    pub colour: ColourMode,
+    /// PAGE_REG_BITS byte 0 bit 7 — 省纸, "save paper".
+    ///
+    /// **Neither vendor tool ever sets this**; the Android app plumbs
+    /// `mSavePaper` through to it but the Linux editor leaves it 0 throughout.
+    /// The hypothesis worth testing is that it suppresses the advance to the
+    /// tear-off position, which would make a second pass over the same label
+    /// possible — and with it, two colours side by side on hardware that
+    /// ignores the two-colour mode. Unverified: treat output as suspect until
+    /// a label says otherwise.
+    pub save_paper: bool,
+}
+
 /// Parameters for building a print buffer.
 pub struct PrintBufferParams<'a> {
     pub image_data: &'a [u8],
@@ -155,7 +171,7 @@ pub struct PrintBufferParams<'a> {
     pub margin_top: u16,
     pub margin_bottom: u16,
     pub density: Density,
-    pub colour: ColourMode,
+    pub page: PageOptions,
 }
 
 /// Build a 4096-byte print buffer.
@@ -181,7 +197,8 @@ pub fn build_print_buffer(p: &PrintBufferParams) -> [u8; PRINT_BUF_SIZE] {
         prt_end: p.prt_end,
         nodu: p.density.black,
         mat: 1,
-        first_cut: p.colour.first_cut(),
+        first_cut: p.page.colour.first_cut(),
+        savepaper: p.page.save_paper,
         ..Default::default()
     });
     buf[2] = page_bits[0];
@@ -243,7 +260,7 @@ pub fn split_into_buffers(
     margin_top: u16,
     margin_bottom: u16,
     density: Density,
-    colour: ColourMode,
+    page: PageOptions,
 ) -> Vec<[u8; PRINT_BUF_SIZE]> {
     let cols = total_cols - margin_top - margin_bottom;
     split_into_banded_buffers(
@@ -252,7 +269,7 @@ pub fn split_into_buffers(
         &[DensityBand { cols, density }],
         margin_top,
         margin_bottom,
-        colour,
+        page,
     )
 }
 
@@ -269,9 +286,9 @@ pub fn split_into_banded_buffers(
     bands: &[DensityBand],
     margin_top: u16,
     margin_bottom: u16,
-    colour: ColourMode,
+    page: PageOptions,
 ) -> Vec<[u8; PRINT_BUF_SIZE]> {
-    let planes = colour.planes();
+    let planes = page.colour.planes();
     let col_stride = per_line_byte as usize * planes as usize;
     let max_cols = (MAX_BUF_DATA / col_stride) as u16;
 
@@ -310,7 +327,7 @@ pub fn split_into_banded_buffers(
                 margin_top,
                 margin_bottom,
                 density,
-                colour,
+                page,
             })
         })
         .collect()
@@ -361,7 +378,7 @@ mod tests {
             margin_top: 8,
             margin_bottom: 8,
             density: Density::uniform(4),
-            colour: ColourMode::Mono,
+            page: PageOptions::default(),
         });
         // Verify buffer structure
         assert_eq!(buf[6], 48); // bytes per line
@@ -389,7 +406,7 @@ mod tests {
             8,
             8,
             Density::uniform(4),
-            ColourMode::Mono,
+            PageOptions::default(),
         );
         assert_eq!(bufs.len(), 3);
     }
@@ -414,8 +431,14 @@ mod tests {
                 density: Density::uniform(15),
             },
         ];
-        let bufs =
-            split_into_banded_buffers(&image_data, per_line_byte, &bands, 8, 8, ColourMode::Mono);
+        let bufs = split_into_banded_buffers(
+            &image_data,
+            per_line_byte,
+            &bands,
+            8,
+            8,
+            PageOptions::default(),
+        );
 
         assert_eq!(bufs.len(), 3);
         assert_eq!([bufs[0][12], bufs[1][12], bufs[2][12]], [2, 9, 15]);
@@ -434,8 +457,14 @@ mod tests {
             cols: 200,
             density: Density::uniform(7),
         }];
-        let bufs =
-            split_into_banded_buffers(&image_data, per_line_byte, &bands, 8, 8, ColourMode::Mono);
+        let bufs = split_into_banded_buffers(
+            &image_data,
+            per_line_byte,
+            &bands,
+            8,
+            8,
+            PageOptions::default(),
+        );
 
         assert_eq!(bufs.len(), 3); // 84 + 84 + 32
         assert!(bufs.iter().all(|b| b[12] == 7));
@@ -458,7 +487,7 @@ mod tests {
             margin_top: 8,
             margin_bottom: 8,
             density: Density { black: 3, red: 12 },
-            colour: ColourMode::Mono,
+            page: PageOptions::default(),
         });
         assert_eq!(buf[12], 12); // red deepness
         assert_eq!((buf[3] >> 2) & 0x0F, 3); // nodu = black
@@ -483,15 +512,24 @@ mod tests {
             &bands,
             8,
             8,
-            ColourMode::TwoColour,
+            PageOptions {
+                colour: ColourMode::TwoColour,
+                ..Default::default()
+            },
         );
         assert_eq!(u16::from_le_bytes([two[0][4], two[0][5]]), cols * 2);
         assert_eq!(two[0][3] & 0x03, 2); // first_cut
         assert_eq!(two[0][12], 9); // red trim survives
         assert_eq!((two[0][3] >> 2) & 0x0F, 5); // black trim survives
 
-        let mono =
-            split_into_banded_buffers(&image_data, per_line_byte, &bands, 8, 8, ColourMode::Mono);
+        let mono = split_into_banded_buffers(
+            &image_data,
+            per_line_byte,
+            &bands,
+            8,
+            8,
+            PageOptions::default(),
+        );
         assert_eq!(u16::from_le_bytes([mono[0][4], mono[0][5]]), cols);
         assert_eq!(mono[0][3] & 0x03, 0);
     }
@@ -513,7 +551,10 @@ mod tests {
             &bands,
             8,
             8,
-            ColourMode::TwoColour,
+            PageOptions {
+                colour: ColourMode::TwoColour,
+                ..Default::default()
+            },
         );
         assert_eq!(bufs.len(), 3); // 42 + 42 + 16
         assert_eq!(u16::from_le_bytes([bufs[0][4], bufs[0][5]]), 42 * 2);
@@ -533,7 +574,7 @@ mod tests {
             8,
             8,
             Density::uniform(4),
-            ColourMode::Mono,
+            PageOptions::default(),
         );
         let banded = split_into_banded_buffers(
             &image_data,
@@ -544,7 +585,7 @@ mod tests {
             }],
             8,
             8,
-            ColourMode::Mono,
+            PageOptions::default(),
         );
         assert_eq!(plain, banded);
     }

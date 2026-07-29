@@ -4,7 +4,7 @@
 //! CHECK_DEVICE -> poll ready -> START_PRINT -> poll printing ->
 //! transfer buffers -> poll complete.
 
-use crate::buffer::{ColourMode, Density};
+use crate::buffer::{ColourMode, Density, PageOptions};
 use crate::cmd::*;
 use crate::data::DATA_PAYLOAD_SIZE;
 use crate::error::{Error, Result};
@@ -157,6 +157,20 @@ impl Printer {
         // frame here: there is no BUF_FULL to ack the transfer instead.
         self.transport.send_bulk_data(record, true).await?;
         Ok(())
+    }
+
+    /// Send an arbitrary opcode and hand back the raw response, for probing
+    /// commands whose frame shape we don't know yet.
+    ///
+    /// Deliberately does no validation — the point is to see what comes back,
+    /// including nothing. `Ok(None)` means the read timed out, which is the
+    /// expected shape of "firmware doesn't implement this".
+    ///
+    /// Callers own the safety question. Some opcodes write, move paper, or enter
+    /// firmware update; see the range warnings in [`crate::cmd`].
+    pub async fn probe_raw(&self, cmd: u8, param: u16) -> Result<Option<Vec<u8>>> {
+        log::info!("PROBE 0x{cmd:02X} param={param}");
+        self.transport.send_cmd(cmd, param).await
     }
 
     /// Wait for device to be idle (not busy, not printing).
@@ -335,7 +349,12 @@ impl Printer {
     }
 
     /// Full test print workflow: generate test pattern, build buffers, compress, print.
-    pub async fn test_print(&self, mat: &MaterialInfo, density: Density) -> Result<()> {
+    pub async fn test_print(
+        &self,
+        mat: &MaterialInfo,
+        density: Density,
+        page: PageOptions,
+    ) -> Result<()> {
         use crate::bitmap::create_test_pattern;
         use crate::buffer::split_into_buffers;
         use crate::compress::compress_buffers;
@@ -348,23 +367,16 @@ impl Printer {
         };
 
         log::info!(
-            "test print: {}mm x {}mm, black={} red={}",
+            "test print: {}mm x {}mm, black={} red={}, save_paper={}",
             label_width_mm,
             height_mm,
             density.black,
-            density.red
+            density.red,
+            page.save_paper
         );
 
         let (image_data, _w, h, bpl) = create_test_pattern(label_width_mm, height_mm);
-        let buffers = split_into_buffers(
-            &image_data,
-            bpl as u8,
-            h as u16,
-            8,
-            8,
-            density,
-            ColourMode::Mono,
-        );
+        let buffers = split_into_buffers(&image_data, bpl as u8, h as u16, 8, 8, density, page);
         log::info!("{} print buffers", buffers.len());
 
         let (compressed, avg) = compress_buffers(&buffers)?;
@@ -422,7 +434,7 @@ impl Printer {
             &bands,
             margin,
             margin,
-            ColourMode::Mono,
+            PageOptions::default(),
         );
         log::info!(
             "swatch ladder: {}mm x {}mm, {} bands of {} cols, densities={:?}",
@@ -490,7 +502,7 @@ impl Printer {
             DEFAULT_MARGIN_DOTS,
             DEFAULT_MARGIN_DOTS,
             density,
-            ColourMode::Mono,
+            PageOptions::default(),
         );
         log::info!(
             "grayscale: {width}x{height}, dither={dither:?}, density={density}, {} buffers",
@@ -555,7 +567,10 @@ impl Printer {
             &bands,
             margin,
             margin,
-            ColourMode::TwoColour,
+            PageOptions {
+                colour: ColourMode::TwoColour,
+                ..Default::default()
+            },
         );
         log::info!(
             "two-colour: {width}x{height}, {} cols, black={} red={}, {} buffers",

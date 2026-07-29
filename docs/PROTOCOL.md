@@ -345,10 +345,18 @@ are a printhead history-compensation artefact, not a density effect.
 **No host-commanded backfeed.** `PAPER_SKIP` (0x2E) feeds forward only and the
 Linux editor never sends it. The editor's 标签对齐 ("label align") button is
 canvas centring (`objCenterClick` sets `scale = 1`), and `keepOnPrintPosition` is
-a host-side resume index for a paused queue, not paper motion. The `Savepaper`
-bit and 2-bit `Cut` field in PAGE_REG_BITS are defined but never set by the
-vendor; their behaviour is unknown. So a true two-pass over one label has no
-documented path.
+a host-side resume index for a paused queue, not paper motion.
+
+`Savepaper` (PAGE_REG_BITS byte 0, bit 7 — 省纸) is defined and plumbed through
+`mSavePaper` in the Android app, but never actually set by either vendor tool.
+**Tested and inert**: two consecutive prints with the bit set produced two
+normally-advanced labels, indistinguishable from the baseline, with no error.
+Exposed as `PageOptions::save_paper` and `supvan-cli test-print --save-paper` so
+the negative result can be re-checked on other models. The 2-bit `Cut` field is
+likewise never set by the vendor and remains untested.
+
+So a true two-pass over one label has no path: no backfeed opcode, and no way to
+suppress the advance.
 
 ### Grayscale: there is none
 
@@ -375,6 +383,48 @@ We halftone in `dither::Ditherer`, selected by `SUPVAN_DITHER` for the IPP app o
 compensation, and adding ours would stop it being their pipeline. Their weights
 (0.3125, 0.1875, 0.375, 0.0625) sum to 15/16 rather than 1, dropping a little
 error per pixel; reproduced as-is.
+
+### Opcode coverage and probe results
+
+`cmd.rs` carried 20 opcodes; the Android `BasePrint.java` declares 54, and
+`AdjustManager` a further 5 in what looked like empty space. An earlier reading
+of the Electron editor alone concluded the vocabulary was complete — it is not,
+and that conclusion was wrong. All are now present in `cmd.rs`.
+
+**Almost none have a call site.** The app declares and never sends
+`PAPER_BACK`, `HTIME_RD`/`HTIME_SET`, every `YINWEI` setter, `SET_OPTLEVEL`,
+`MAT_AUTHEN_RESULT`, `READ_RANDOM`/`VERIFY_RANDOM`, `SET_TIMESTAMP`,
+`FORCEUPDATE`, `SET_DENSITY`, `SET_HEADRATE`. Exercised ones are
+`0x39 SET_TB_YINWEI` (G-series, `sendCmd(cmd, value, [0u8; 64])`),
+`0xBC CHECK_OPTLEVEL` (**`T50PlusPrint`**, `sendCmdStartTrans(cmd, i, i2, [0u8; 64])`),
+`0x18 STRD_MAT`, and `0x67`/`0x68 RD`/`WR_DEV_OPT`.
+
+**Unallocated numbers: 171** inside `0x10`–`0xF0`, the largest holes being
+`0x6B-0xAF` (69), `0xDA-0xEF` (22), `0x45-0x57` (19). AdjustManager filling
+`0x60-0x62`/`0x6F`/`0xB2` is the standing warning that these are *unknown*, not
+unused.
+
+**Probing.** USB HID replies do not echo the command byte
+(`usb_transport::validate_response` — any non-empty reply is treated as an ack),
+so presence of a reply proves nothing. The discriminator is reply *content*
+against a baseline captured from deliberately unallocated opcodes. Not-implemented
+answers `08 00 00 10 00 00 00 b0 04 …`.
+
+`supvan-cli probe-reads` does this, with a deny-list refusing anything that
+writes, moves paper, or falls in `0xC0-0xEF` — an unrecognised opcode there
+risks leaving the unit in a bootloader awaiting an image.
+
+Result on a T50M Pro (`T0117A2410211517`), 15 read-only opcodes:
+
+| opcode | result |
+|--------|--------|
+| `0xB1 RD_TIMESTAMP` | **implemented** — ASCII `"20230412"`, length-prefixed `0x0a` |
+| the other 14 | identical to the unallocated baseline — not implemented |
+
+Notably `0x2B HTIME_RD` is **not** implemented, so `0x2C HTIME_SET` almost
+certainly is not either: setting heat time directly, bypassing the RFID record,
+is not available on this unit. `0xBA PAPER_BACK` remains untested — it moves
+paper, so it is deny-listed from the read sweep.
 
 **Status flag — `FirmwareNeedUpgrade`.** The Linux tool decodes a "firmware
 needs upgrade" flag from status byte `[3] & 0x20` (G-series `gPrintFlag.js`) —

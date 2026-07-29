@@ -34,10 +34,11 @@ pub const CMD_CHECK_RIB: u8 = 0x19;
 
 /// RD_LAB_DPI (0x22) — read the loaded label's DPI (response carries DPI×100 as
 /// a little-endian u16; the offset varies per material). Used by the G/TP/MP50
-/// plugins. `0x24`/`0x25` are per-material read variants.
+/// plugins. The Android `BasePrint` calls this one `CMD_READ_DPI`.
 pub const CMD_RD_LAB_DPI: u8 = 0x22;
+/// Per-material DPI read variant from the `sp` plugin. `BasePrint` does not name
+/// 0x24, so this reading is from the Linux tool alone.
 pub const CMD_RD_LAB_DPI_24: u8 = 0x24;
-pub const CMD_RD_LAB_DPI_25: u8 = 0x25;
 
 /// SET_PRTMODE (0x33) — set print mode. MP50/P70-family in the vendor tool.
 pub const CMD_SET_PRTMODE: u8 = 0x33;
@@ -54,6 +55,115 @@ pub const CMD_SET_RFID_DATA: u8 = 0x5D;
 /// in the vendor tool but never sent; the live bitmap path is
 /// [`CMD_NEXT_ZIPPEDBULK`]. Possibly an alternate transfer mode/model.
 pub const CMD_TRANSFER: u8 = 0xF0;
+
+// --- Opcodes from the Android app (`BasePrint.java`, plus `AdjustManager`).
+//
+// The Electron editor exposes a far smaller vocabulary than the Android app;
+// an earlier reading of it alone concluded the command set was complete, which
+// was wrong. `BasePrint` declares 54 opcodes against the editor's ~20.
+//
+// **Almost none of these have a call site.** The app declares them and never
+// sends them, so for most we have a number and a name but no observed frame
+// shape, no parameter semantics, and no evidence this firmware implements them.
+// Treat every one as unverified until a device round-trip says otherwise. The
+// handful that *are* exercised say so individually.
+
+/// STRD_MAT (0x18) — standard/stored material query. One of the few with call
+/// sites: `sendCmd(cmd, 0, buf)` in `D15TPrint`, `sendCmdRefreshStatus(cmd, 0)`
+/// in `TP76iPrint`. Not seen on the T50 path.
+pub const CMD_STRD_MAT: u8 = 0x18;
+
+/// Heat-time read/set — the same printhead pulse widths the RFID material
+/// record carries at offsets 36/38, but addressable directly instead of through
+/// an 80-byte record. If the firmware honours these, per-band heat becomes
+/// possible without rewriting the material. No call sites.
+pub const BLTCMD_HTIME_RD: u8 = 0x2B;
+pub const BLTCMD_HTIME_SET: u8 = 0x2C;
+
+/// Print-position (印位, "yin wei") adjustment: label origin, printhead offset,
+/// left/right and top/bottom shift. Only `SET_TB_YINWEI` has call sites, in the
+/// G-series (`sendCmd(cmd, value, [0u8; 64])` — a value plus a 64-byte payload).
+pub const CMD_SET_LAB_YINWEI: u8 = 0x25;
+pub const CMD_RD_HD_YINWEI: u8 = 0x26;
+pub const CMD_SET_HD_YINWEI: u8 = 0x27;
+/// 0x31 carries two names in `BasePrint` — `RD_COnLAB_YINWEI` and `RD_DEV_DPI`.
+pub const CMD_RD_CONLAB_YINWEI: u8 = 0x31;
+pub const CMD_SET_RL_YINWEI: u8 = 0x38;
+pub const CMD_SET_TB_YINWEI: u8 = 0x39;
+
+/// PAPER_BACK (0xBA) — reverse feed.
+///
+/// Its existence corrects the earlier claim in `docs/PROTOCOL.md` that the
+/// protocol has no backfeed. **But the app never sends it**, so the parameter
+/// (distance? units?) is unknown, as is whether this firmware implements it.
+/// Backfeeding blind can jam the roll — establish the parameter before use.
+pub const CMD_PAPER_BACK: u8 = 0xBA;
+
+/// Gap/optical sensor level. `CHECK_OPTLEVEL` is the only one of the three with
+/// a call site, and notably it is in `T50PlusPrint` — our own model's class:
+/// `sendCmdStartTrans(0xBC, i, i2, [0u8; 64])`, i.e. the two-parameter
+/// [`make_cmd_start_trans`] shape.
+pub const CMD_CHECK_OPTLEVEL: u8 = 0xBC;
+pub const CMD_READ_OPTLEVEL: u8 = 0xBD;
+pub const CMD_SET_OPTLEVEL: u8 = 0xBE;
+
+/// Bluetooth link control and device parameter/option blocks. `RD_DEV_OPT` and
+/// `WR_DEV_OPT` have call sites; the `BLTCMD_*_DEV_PAR` pair does not.
+pub const CMD_SET_BLTCONTROL: u8 = 0x37;
+pub const CMD_RD_DEV_OPT: u8 = 0x67;
+pub const CMD_WR_DEV_OPT: u8 = 0x68;
+pub const BLTCMD_RD_DEV_PAR: u8 = 0x69;
+pub const BLTCMD_WR_DEV_PAR: u8 = 0x6A;
+
+/// Power-off timeout and buzzer/key configuration. No call sites.
+pub const CMD_READ_POWER_OFF_TIME: u8 = 0x41;
+pub const CMD_SET_POWER_OFF_TIME: u8 = 0x42;
+pub const CMD_READ_BUZZER_KEY: u8 = 0x43;
+pub const CMD_SET_BUZZER_KEY: u8 = 0x44;
+
+/// RD_USER_INF (0x58) — user information block. No call sites.
+pub const CMD_RD_USER_INF: u8 = 0x58;
+
+/// Consumable anti-counterfeit challenge/response and timestamps — the
+/// device-side half of the authentication the RFID record's `Cipertext` and
+/// `TimeStamp` fields belong to. Since the vendor ships those fields zeroed
+/// (see [`crate::rfid`]), this whole family is presumably dormant. No call sites.
+pub const CMD_SET_TIMESTAMP: u8 = 0xB0;
+pub const CMD_RD_TIMESTAMP: u8 = 0xB1;
+pub const CMD_MAT_AUTHEN_RESULT: u8 = 0xB6;
+pub const CMD_READ_RANDOM: u8 = 0xD5;
+pub const CMD_VERIFY_RANDOM: u8 = 0xD6;
+
+/// Density and printhead rate as standalone commands, rather than the
+/// per-buffer trims in [`crate::buffer::Density`]. No call sites.
+pub const CMD_BLTCMD_SET_HEADRATE: u8 = 0xC9;
+pub const CMD_BLTCMD_SET_DENSITY: u8 = 0xD9;
+
+/// BLE firmware-update path: buffer-oriented, distinct from the
+/// [`CMD_UPDATE_FW`] (0xC6) chunked transfer. `FORCEUPDATE` presumably bypasses
+/// the version check.
+///
+/// **Do not probe this range.** An unrecognised opcode here risks leaving the
+/// unit in a bootloader waiting for an image.
+pub const BLTCMD_START_FW_BUFFER_DATA: u8 = 0xD0;
+pub const BLTCMD_SEND_FW_BUFFER_DATA: u8 = 0xD1;
+pub const BLTCMD_UPDATA_FINISH: u8 = 0xD2;
+pub const CMD_FORCEUPDATE: u8 = 0xD3;
+
+/// BLE bulk transfer (0x5A) — the GATT-side analogue of
+/// [`CMD_NEXT_ZIPPEDBULK`].
+pub const BLTCMD_NEXTFRM_BULK: u8 = 0x5A;
+
+// --- `AdjustManager` (calibration/service menu). A second constant table that
+// fills part of what looked like empty opcode space — a reminder that the holes
+// listed in docs/PROTOCOL.md are "unknown", not "unused".
+
+pub const CMD_ADJ_READ_DATA: u8 = 0x60;
+pub const CMD_ADJ_WRITE_DATA: u8 = 0x61;
+/// **Destructive.** Excluded from any probe sweep.
+pub const CMD_ADJ_RESTORE_FACTORY: u8 = 0x62;
+pub const CMD_ADJ_WRITE_START: u8 = 0x6F;
+pub const CMD_ADJ_RD_CONTINUE: u8 = 0xB2;
 
 /// Build a standard 16-byte command frame (0x7E 0x5A format).
 ///

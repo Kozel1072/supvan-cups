@@ -14,9 +14,10 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use supvan_proto::bitmap::{
-    CardPattern, PRINTHEAD_WIDTH_MM, create_gray_ramp, create_two_colour_pattern,
+    CardPattern, PRINTHEAD_WIDTH_MM, create_gray_bands, create_gray_ramp, create_two_colour_pattern,
 };
-use supvan_proto::buffer::Density;
+use supvan_proto::buffer::{Density, PageOptions};
+use supvan_proto::cmd;
 use supvan_proto::dither::DitherMode;
 use supvan_proto::printer::Printer;
 use supvan_proto::rfid::{RfidMaterial, heat_presets};
@@ -67,6 +68,11 @@ enum Command {
         /// Red print density (0-15); defaults to matching --density
         #[arg(long)]
         red_density: Option<u8>,
+        /// Set the undocumented PAGE_REG_BITS savepaper bit (省纸). Neither
+        /// vendor tool ever sets it; the guess under test is that it suppresses
+        /// the advance to the tear-off position.
+        #[arg(long)]
+        save_paper: bool,
     },
     /// Feed/advance one blank label (PAPER_SKIP)
     Feed {
@@ -151,9 +157,26 @@ enum Command {
         /// Grey steps from white to black
         #[arg(long, default_value_t = 8)]
         steps: u32,
+        /// Lay the steps as vertical bands across the head instead of down the
+        /// feed, so every printhead line carries all of them at once
+        #[arg(long)]
+        vertical: bool,
         /// Density as `N` or `BLACK:RED`
         #[arg(long, value_parser = parse_density, default_value = "8")]
         density: Density,
+    },
+    /// Send read-only opcodes and dump the raw responses, to learn which the
+    /// firmware implements and what frame shape each returns.
+    ///
+    /// Reads only. Nothing here writes, moves paper, or touches the firmware
+    /// range — see `probe_raw` and the range warnings in `supvan_proto::cmd`.
+    ProbeReads {
+        /// Bluetooth address or /dev/hidrawN path
+        target: String,
+        /// Extra opcodes to try, hex or decimal (e.g. 0x2B,0xBD). Vetted against
+        /// the write/motion/firmware deny-list before sending.
+        #[arg(long, value_delimiter = ',', value_parser = parse_opcode)]
+        also: Vec<u8>,
     },
     /// Scan for Supvan Bluetooth devices (via BlueZ D-Bus)
     Discover,
@@ -250,7 +273,7 @@ async fn cmd_material(target: &str) -> CliResult {
     Ok(())
 }
 
-async fn cmd_test_print(target: &str, density: Density) -> CliResult {
+async fn cmd_test_print(target: &str, density: Density, save_paper: bool) -> CliResult {
     let printer = connect(target)?;
 
     // Query material to get label dimensions, falling back to printhead-width
@@ -274,7 +297,16 @@ async fn cmd_test_print(target: &str, density: Density) -> CliResult {
         "Printing test pattern on {}mm x {}mm label...",
         mat.width_mm, mat.height_mm
     );
-    printer.test_print(&mat, density).await?;
+    printer
+        .test_print(
+            &mat,
+            density,
+            PageOptions {
+                save_paper,
+                ..Default::default()
+            },
+        )
+        .await?;
     eprintln!("Done.");
     Ok(())
 }
@@ -395,11 +427,21 @@ async fn cmd_gray_ramp(
     dither: DitherMode,
     steps: u32,
     density: Density,
+    vertical: bool,
 ) -> CliResult {
     let printer = connect(target)?;
-    let (gray, w, h) = create_gray_ramp(width as u32, length as u32, steps);
+    let (gray, w, h) = if vertical {
+        create_gray_bands(width as u32, length as u32, steps)
+    } else {
+        create_gray_ramp(width as u32, length as u32, steps)
+    };
+    let layout = if vertical {
+        "vertical bands across the head"
+    } else {
+        "steps down the feed"
+    };
     eprintln!(
-        "Grey ramp on {width}mm x {length}mm: {steps} steps white->black, \
+        "Grey ramp on {width}mm x {length}mm: {steps} {layout}, white->black, \
 dither={dither:?}, density={density}."
     );
     printer
@@ -407,6 +449,174 @@ dither={dither:?}, density={density}."
         .await?;
     eprintln!("Done.");
     Ok(())
+}
+
+/// Opcodes that write, move paper, or enter firmware update. Refused by
+/// `probe-reads` regardless of what the caller asks for: the whole point of that
+/// command is that it cannot change device state.
+fn is_probe_safe(op: u8) -> bool {
+    // Firmware update territory — an unrecognised opcode here can leave the unit
+    // in a bootloader waiting for an image.
+    if (0xC0..=0xEF).contains(&op) {
+        return false;
+    }
+    !matches!(
+        op,
+        cmd::CMD_ADJ_RESTORE_FACTORY
+            | cmd::CMD_ADJ_WRITE_DATA
+            | cmd::CMD_ADJ_WRITE_START
+            | cmd::CMD_WR_DEV_OPT
+            | cmd::BLTCMD_WR_DEV_PAR
+            | cmd::CMD_SET_RFID_DATA
+            | cmd::CMD_PAPER_BACK
+            | cmd::CMD_PAPER_SKIP
+            | cmd::CMD_START_PRINT
+            | cmd::CMD_SET_TIMESTAMP
+            | cmd::CMD_SET_OPTLEVEL
+            | cmd::CMD_SET_LAB_YINWEI
+            | cmd::CMD_SET_HD_YINWEI
+            | cmd::CMD_SET_RL_YINWEI
+            | cmd::CMD_SET_TB_YINWEI
+            | cmd::CMD_SET_BLTCONTROL
+            | cmd::CMD_SET_POWER_OFF_TIME
+            | cmd::CMD_SET_BUZZER_KEY
+            | cmd::CMD_SET_PRTMODE
+            | cmd::BLTCMD_HTIME_SET
+    )
+}
+
+fn parse_opcode(s: &str) -> Result<u8, String> {
+    let parsed = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .map(|hex| u8::from_str_radix(hex, 16))
+        .unwrap_or_else(|| s.parse());
+    let op = parsed.map_err(|_| format!("bad opcode `{s}`"))?;
+    if is_probe_safe(op) {
+        Ok(op)
+    } else {
+        Err(format!(
+            "0x{op:02X} writes, moves paper, or is in the firmware range"
+        ))
+    }
+}
+
+async fn cmd_probe_reads(target: &str, also: Vec<u8>) -> CliResult {
+    /// Read-only opcodes worth asking about, with what we expect them to mean.
+    const READS: &[(u8, &str)] = &[
+        (cmd::CMD_STRD_MAT, "STRD_MAT — stored/standard material"),
+        (cmd::BLTCMD_HTIME_RD, "HTIME_RD — heat time"),
+        (cmd::CMD_RD_HD_YINWEI, "RD_HD_YINWEI — printhead offset"),
+        (cmd::CMD_RD_CONLAB_YINWEI, "RD_CONLAB_YINWEI / RD_DEV_DPI"),
+        (cmd::CMD_READ_POWER_OFF_TIME, "READ_POWER_OFF_TIME"),
+        (cmd::CMD_READ_BUZZER_KEY, "READ_BUZZER_KEY"),
+        (cmd::CMD_RD_USER_INF, "RD_USER_INF — user info block"),
+        (cmd::CMD_ADJ_READ_DATA, "ADJ_READ_DATA — calibration block"),
+        (cmd::CMD_RD_DEV_OPT, "RD_DEV_OPT — device options"),
+        (
+            cmd::BLTCMD_RD_DEV_PAR,
+            "BLTCMD_RD_DEV_PAR — device parameters",
+        ),
+        (cmd::CMD_RD_TIMESTAMP, "RD_TIMESTAMP"),
+        (cmd::CMD_ADJ_RD_CONTINUE, "ADJ_RD_CONTINUE"),
+        (cmd::CMD_MAT_AUTHEN_RESULT, "MAT_AUTHEN_RESULT"),
+        (cmd::CMD_CHECK_RIB, "CHECK_RIB — ribbon"),
+        (cmd::CMD_RD_LAB_DPI, "RD_LAB_DPI"),
+    ];
+
+    /// Opcodes from the middle of the largest unallocated hole. Used only to
+    /// learn what "not implemented" looks like on the wire — USB HID does not
+    /// echo the command byte (`usb_transport::validate_response`), so a
+    /// non-empty response proves nothing on its own and the reply *content* is
+    /// the only discriminator.
+    const UNALLOCATED: [u8; 2] = [0x50, 0x51];
+
+    /// Trailing bytes of every reply are device-constant; only the head varies.
+    const COMPARE_LEN: usize = 16;
+
+    let printer = connect(target)?;
+
+    let control = printer
+        .probe_raw(cmd::CMD_CHECK_DEVICE, 0)
+        .await?
+        .ok_or("control probe got no response — check the link before trusting results")?;
+    eprintln!(
+        "control   0x12 CHECK_DEVICE  {:02x?}",
+        head(&control, COMPARE_LEN)
+    );
+
+    // Calibrate the negative before trusting any positive.
+    let mut baseline = None;
+    for op in UNALLOCATED {
+        if let Some(r) = printer.probe_raw(op, 0).await? {
+            eprintln!(
+                "baseline  0x{op:02X} (unallocated) {:02x?}",
+                head(&r, COMPARE_LEN)
+            );
+            match &baseline {
+                None => baseline = Some(head(&r, COMPARE_LEN).to_vec()),
+                Some(b) if b != head(&r, COMPARE_LEN) => {
+                    eprintln!("  note: unallocated opcodes disagree; classification is unreliable");
+                }
+                _ => {}
+            }
+        }
+    }
+    let Some(baseline) = baseline else {
+        return Err("unallocated opcodes gave no response; cannot calibrate".into());
+    };
+    eprintln!();
+
+    let extra: Vec<(u8, &str)> = also.iter().map(|&op| (op, "(requested)")).collect();
+    let mut implemented = Vec::new();
+
+    for &(op, label) in READS.iter().chain(extra.iter()) {
+        match printer.probe_raw(op, 0).await? {
+            Some(r) => {
+                let h = head(&r, COMPARE_LEN);
+                let differs = h != baseline.as_slice();
+                eprintln!(
+                    "0x{op:02X} {label:38} {} {:02x?}",
+                    if differs { "IMPL " } else { "  -  " },
+                    h
+                );
+                if differs {
+                    implemented.push((op, label, ascii_of(h)));
+                }
+            }
+            None => eprintln!("0x{op:02X} {label:38}   -   (no response)"),
+        }
+
+        if let Some(st) = printer.query_status().await?
+            && let Some(errs) = st.error_description()
+        {
+            return Err(format!("aborting after 0x{op:02X}: printer reports {errs}").into());
+        }
+    }
+
+    eprintln!(
+        "\n{} opcode(s) answered differently from unallocated:",
+        implemented.len()
+    );
+    for (op, label, ascii) in &implemented {
+        eprintln!("  0x{op:02X} {label}{}", ascii.as_deref().unwrap_or(""));
+    }
+    Ok(())
+}
+
+fn head(resp: &[u8], n: usize) -> &[u8] {
+    &resp[..resp.len().min(n)]
+}
+
+/// Surface any printable run in a reply — `RD_TIMESTAMP` answers in ASCII, and
+/// others may too.
+fn ascii_of(bytes: &[u8]) -> Option<String> {
+    let run: String = bytes
+        .iter()
+        .filter(|b| b.is_ascii_graphic())
+        .map(|&b| b as char)
+        .collect();
+    (run.len() >= 4).then(|| format!("  ascii={run:?}"))
 }
 
 /// Parse the test-card pattern name.
@@ -519,6 +729,7 @@ async fn main() -> ExitCode {
             target,
             density,
             red_density,
+            save_paper,
         } => {
             cmd_test_print(
                 &target,
@@ -526,6 +737,7 @@ async fn main() -> ExitCode {
                     black: density,
                     red: red_density.unwrap_or(density),
                 },
+                save_paper,
             )
             .await
         }
@@ -558,7 +770,9 @@ async fn main() -> ExitCode {
             dither,
             steps,
             density,
-        } => cmd_gray_ramp(&target, width, length, dither, steps, density).await,
+            vertical,
+        } => cmd_gray_ramp(&target, width, length, dither, steps, density, vertical).await,
+        Command::ProbeReads { target, also } => cmd_probe_reads(&target, also).await,
         Command::Discover => {
             cmd_discover();
             Ok(())
@@ -579,6 +793,7 @@ mod tests {
     use super::{Cli, Command};
     use clap::Parser;
     use supvan_proto::buffer::Density;
+    use supvan_proto::cmd;
 
     #[test]
     fn parse_probe_with_target() {
@@ -669,6 +884,38 @@ mod tests {
             panic!("expected Provision");
         };
         assert_eq!(code, 5618);
+    }
+
+    /// The deny-list is a safety boundary, not a convenience: probe-reads must
+    /// refuse anything that writes, moves paper, or could enter the bootloader,
+    /// no matter what the caller asks for.
+    #[test]
+    fn probe_deny_list_refuses_dangerous_opcodes() {
+        for op in [
+            cmd::CMD_ADJ_RESTORE_FACTORY,
+            cmd::CMD_PAPER_BACK,
+            cmd::CMD_PAPER_SKIP,
+            cmd::CMD_SET_RFID_DATA,
+            cmd::CMD_WR_DEV_OPT,
+            cmd::BLTCMD_HTIME_SET,
+            cmd::CMD_START_PRINT,
+        ] {
+            assert!(!super::is_probe_safe(op), "0x{op:02X} should be refused");
+            assert!(super::parse_opcode(&format!("0x{op:02X}")).is_err());
+        }
+
+        // The whole firmware range, not just the opcodes we happen to know.
+        for op in 0xC0u8..=0xEF {
+            assert!(!super::is_probe_safe(op), "0x{op:02X} is firmware range");
+        }
+    }
+
+    #[test]
+    fn probe_accepts_reads_in_both_radixes() {
+        assert!(super::is_probe_safe(cmd::BLTCMD_HTIME_RD));
+        assert_eq!(super::parse_opcode("0x2B"), Ok(cmd::BLTCMD_HTIME_RD));
+        assert_eq!(super::parse_opcode("43"), Ok(cmd::BLTCMD_HTIME_RD));
+        assert!(super::parse_opcode("zzz").is_err());
     }
 
     #[test]
