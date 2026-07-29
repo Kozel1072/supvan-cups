@@ -173,7 +173,7 @@ output-only (no parsed response).
 | 0x2E | PAPER_SKIP          | host → device   | 8-byte ack                | 8-byte ack                   | —                                  |
 | 0x30 | RETURN_MAT          | host ↔ device   | ≥57-byte material frame   | **64-byte** material frame   | `parse_material` / `parse_usb_material` |
 | 0x5C | NEXT_ZIPPEDBULK     | host → device   | uses `make_cmd_start_trans`; signals next block of zipped raster | same | — |
-| 0x5D | SET_RFID_DATA       | host → device   | not yet exercised         | not yet exercised            | — |
+| 0x5D | SET_RFID_DATA       | host → device   | 8-byte ack, then bulk payload | 8-byte ack, then bulk payload | `rfid::RfidMaterial::encode`; see below |
 | 0xC5 | READ_FWVER          | host ↔ device   | ≥23-byte frame; firmware byte at [22] | **stub** (8-byte)  | `parse_firmware_version`           |
 | 0xC6 | UPDATE_FW           | host → device   | firmware-transfer start (`0xAA 0xC7` packets follow) | same | `build_firmware_frames`; see docs/FIRMWARE.md |
 
@@ -196,6 +196,88 @@ its own USB/serial framing, not our 22-byte-header BT frames).
 
 `0x11` doubles as `INQUIRY_STA` and a `FINISH_PRINT` marker; `0x14` doubles as
 `STOP_PRINT` / `RESET_PRINT`.
+
+### SET_RFID_DATA (0x5D) — synthetic material records
+
+Genuine consumables carry an RFID tag the printer reads via `RETURN_MAT`. Stock
+whose tag the printer can't read — third-party, or another brand's — returns an
+all-zero material record and raises `label_rw_error`. The vendor's answer is to
+synthesise the record host-side and push it over 0x5D, gated on exactly that
+all-zero UUID (`MatCtrlFunc.sendRfid()`, for T50/T50S/T50Plus/T50Pro/T80Pro):
+
+    if (UUID.indexOf("00000000") == -1)  isRFIDLabel = false   // real tag, leave it
+    else                                 isRFIDLabel = true    // blank, send one
+
+Two steps on the wire: announce the payload length under 0x5D, then bulk-write
+the record. The vendor's `CMD_SET_RFID_DATA_WRITE: 999` is an internal step
+marker, not a second opcode. `printer::Printer::set_rfid_data` implements this;
+`supvan-cli provision` drives it.
+
+**Record layout** (80 bytes; every field but the UUID sits at base offset 16,
+matching the vendor's `databuf[N + offset]`):
+
+| Offset | Size | Field |
+|-------:|-----:|-------|
+| 0  | 7  | UUID — decimal catalogue code, right-padded with `'0'` to 14 hex chars |
+| 16 | 8  | MatCode (left zero for synthetic records) |
+| 24 | 2  | MatSn, LE u16 |
+| 26 | 1  | MatType (`PaperTypeEnum`) |
+| 27 | 1  | width across the printhead, mm (≤50) |
+| 28 | 1  | length along the feed, mm (≤120) |
+| 29 | 1  | CustomID (0 = Supvan, 1 = 贴博士) |
+| 30 | 1  | GapDistance, mm |
+| 31 | 1  | TailLength, mm |
+| 32 | 4  | RemainUsage (labels), LE u32 |
+| 36 | 2  | **HeatTime5**, LE u16 |
+| 38 | 2  | **HeatTime40**, LE u16 |
+| 40 | 6  | TimeStamp (zero) |
+| 48 | 16 | Cipertext (zero) |
+| 64 | 2  | MinOptThreshold, LE u16 |
+| 66 | 2  | MaxOptThreshold, LE u16 |
+| 68 | 1  | OptIndex |
+| 69 | 1  | HeatIndex |
+
+The anti-counterfeit fields are zero because the vendor ships them that way:
+`GeneralCipertext1..5()` are commented out and `Cipertext` stays `null`, which
+its `deepCopy()` turns into `{}` — so `Cipertext[i]` is `undefined` and lands in
+the `Uint8Array` as 0. The `Password` that `generalPassword()` computes is never
+serialised. Reimplementing that crypto would be dead work.
+
+**HeatTime5 / HeatTime40** are printhead pulse widths at 5 °C and 40 °C ambient,
+which the firmware interpolates between — the only *absolute* energy control in
+the protocol. Vendor presets, selected by catalogue code:
+
+| Profile | HeatTime5 | HeatTime40 |
+|---------|----------:|-----------:|
+| standard label stock          | 1700 | 1200 |
+| index / transparent black-mark | 1800 | 1300 |
+| black-mark cardstock          | 2500 | 2000 |
+
+### Energy control and its limits
+
+Two knobs, in series: the material record's heat times set absolute pulse width,
+and the per-buffer density (`nodu`, 0–15) trims it. Density is encoded twice in
+each print buffer — `buf[12]` and the `nodu` field of PAGE_REG_BITS — and both
+carry the same value.
+
+Because density lives in the buffer header and buffers tile the label along the
+**feed** axis, energy can differ from one printhead line to the next, down to a
+single-column buffer (0.125 mm at 8 dots/mm). It cannot differ *within* a line:
+all 384 dots across the head share one energy. `buffer::split_into_banded_buffers`
+exposes this as a list of `DensityBand`s.
+
+There is no colour concept anywhere in the firmware — `PaperTypeEnum` has 16
+entries and none of them is two-colour. Energy-selected two-colour stock is
+therefore driven purely by heat time and density; `supvan-cli heat-sweep` walks
+both to find where a given roll's colour flips.
+
+**No host-commanded backfeed.** `PAPER_SKIP` (0x2E) feeds forward only and the
+Linux editor never sends it. The editor's 标签对齐 ("label align") button is
+canvas centring (`objCenterClick` sets `scale = 1`), and `keepOnPrintPosition` is
+a host-side resume index for a paused queue, not paper motion. The `Savepaper`
+bit and 2-bit `Cut` field in PAGE_REG_BITS are defined but never set by the
+vendor; their behaviour is unknown. So a true two-pass over one label has no
+documented path.
 
 **Status flag — `FirmwareNeedUpgrade`.** The Linux tool decodes a "firmware
 needs upgrade" flag from status byte `[3] & 0x20` (G-series `gPrintFlag.js`) —
