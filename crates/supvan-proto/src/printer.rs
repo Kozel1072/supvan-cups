@@ -4,6 +4,7 @@
 //! CHECK_DEVICE -> poll ready -> START_PRINT -> poll printing ->
 //! transfer buffers -> poll complete.
 
+use crate::buffer::Density;
 use crate::cmd::*;
 use crate::data::DATA_PAYLOAD_SIZE;
 use crate::error::{Error, Result};
@@ -334,7 +335,7 @@ impl Printer {
     }
 
     /// Full test print workflow: generate test pattern, build buffers, compress, print.
-    pub async fn test_print(&self, mat: &MaterialInfo, density: u8) -> Result<()> {
+    pub async fn test_print(&self, mat: &MaterialInfo, density: Density) -> Result<()> {
         use crate::bitmap::create_test_pattern;
         use crate::buffer::split_into_buffers;
         use crate::compress::compress_buffers;
@@ -347,10 +348,11 @@ impl Printer {
         };
 
         log::info!(
-            "test print: {}mm x {}mm, density={}",
+            "test print: {}mm x {}mm, black={} red={}",
             label_width_mm,
             height_mm,
-            density
+            density.black,
+            density.red
         );
 
         let (image_data, _w, h, bpl) = create_test_pattern(label_width_mm, height_mm);
@@ -372,15 +374,15 @@ impl Printer {
     /// Print one calibration strip: a solid block per entry in `densities`, laid
     /// down the feed direction in order, each burned at its own density.
     ///
-    /// Pair with [`set_rfid_data`](Self::set_rfid_data) to vary the heat times
-    /// between strips: heat time sets the absolute energy, density trims it, and
-    /// on energy-selected two-colour stock the pair decides which colour
-    /// develops.
+    /// Each band carries its own black *and* red trim, so one strip can walk the
+    /// two against each other. Pair with [`set_rfid_data`](Self::set_rfid_data)
+    /// to vary heat times between strips: heat time sets absolute energy, the
+    /// density pair trims it, and on two-colour stock that decides the colour.
     pub async fn print_swatch_ladder(
         &self,
         label_width_mm: u32,
         height_mm: u32,
-        densities: &[u8],
+        densities: &[Density],
     ) -> Result<()> {
         use crate::bitmap::create_swatch_ladder;
         use crate::buffer::{DensityBand, split_into_banded_buffers};

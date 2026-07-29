@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use supvan_proto::bitmap::PRINTHEAD_WIDTH_MM;
+use supvan_proto::buffer::Density;
 use supvan_proto::printer::Printer;
 use supvan_proto::rfid::{RfidMaterial, heat_presets};
 use supvan_proto::status::{DEFAULT_LABEL_GAP_MM, DEFAULT_LABEL_HEIGHT_MM, MaterialInfo};
@@ -42,9 +43,12 @@ enum Command {
     TestPrint {
         /// Bluetooth address or /dev/hidrawN path
         target: String,
-        /// Print density (0-15)
+        /// Black print density (0-15)
         #[arg(short, long, default_value_t = 4)]
         density: u8,
+        /// Red print density (0-15); defaults to matching --density
+        #[arg(long)]
+        red_density: Option<u8>,
     },
     /// Feed/advance one blank label (PAPER_SKIP)
     Feed {
@@ -94,9 +98,11 @@ enum Command {
         /// the three the vendor ships.
         #[arg(long = "heat", value_parser = parse_heat_pair)]
         heats: Vec<(u16, u16)>,
-        /// Densities to lay down the strip, top to bottom
-        #[arg(long, value_delimiter = ',', default_values_t = [0u8, 2, 4, 6, 8, 10, 12, 15])]
-        densities: Vec<u8>,
+        /// Densities to lay down the strip, top to bottom. Each entry is either
+        /// `N` (both trims at N) or `BLACK:RED` to drive them independently.
+        #[arg(long, value_delimiter = ',', value_parser = parse_density,
+              default_value = "0,2,4,6,8,10,12,15")]
+        densities: Vec<Density>,
     },
     /// Scan for Supvan Bluetooth devices (via BlueZ D-Bus)
     Discover,
@@ -193,7 +199,7 @@ async fn cmd_material(target: &str) -> CliResult {
     Ok(())
 }
 
-async fn cmd_test_print(target: &str, density: u8) -> CliResult {
+async fn cmd_test_print(target: &str, density: Density) -> CliResult {
     let printer = connect(target)?;
 
     // Query material to get label dimensions, falling back to printhead-width
@@ -227,6 +233,19 @@ async fn cmd_feed(target: &str) -> CliResult {
     printer.paper_skip().await?;
     eprintln!("Fed one label.");
     Ok(())
+}
+
+/// Parse a density entry: `N` sets both trims, `BLACK:RED` sets them apart.
+fn parse_density(s: &str) -> Result<Density, String> {
+    match s.split_once(':') {
+        Some((black, red)) => Ok(Density {
+            black: black.parse().map_err(|_| format!("bad black `{black}`"))?,
+            red: red.parse().map_err(|_| format!("bad red `{red}`"))?,
+        }),
+        None => Ok(Density::uniform(
+            s.parse().map_err(|_| format!("bad density `{s}`"))?,
+        )),
+    }
 }
 
 /// Parse a `heat5:heat40` pair, e.g. `1700:1200`.
@@ -324,7 +343,7 @@ async fn cmd_heat_sweep(
     length: u8,
     gap: u8,
     heats: Vec<(u16, u16)>,
-    densities: Vec<u8>,
+    densities: Vec<Density>,
 ) -> CliResult {
     let heats = if heats.is_empty() {
         vec![
@@ -380,7 +399,20 @@ async fn main() -> ExitCode {
     let result = match cli.command {
         Command::Probe { target } => cmd_probe(&target).await,
         Command::Material { target } => cmd_material(&target).await,
-        Command::TestPrint { target, density } => cmd_test_print(&target, density).await,
+        Command::TestPrint {
+            target,
+            density,
+            red_density,
+        } => {
+            cmd_test_print(
+                &target,
+                Density {
+                    black: density,
+                    red: red_density.unwrap_or(density),
+                },
+            )
+            .await
+        }
         Command::Feed { target } => cmd_feed(&target).await,
         Command::Provision {
             target,
@@ -418,6 +450,7 @@ async fn main() -> ExitCode {
 mod tests {
     use super::{Cli, Command};
     use clap::Parser;
+    use supvan_proto::buffer::Density;
 
     #[test]
     fn parse_probe_with_target() {
@@ -445,7 +478,9 @@ mod tests {
         ])
         .unwrap();
         match cli.command {
-            Command::TestPrint { target, density } => {
+            Command::TestPrint {
+                target, density, ..
+            } => {
                 assert_eq!(target, "AA:BB:CC:DD:EE:FF");
                 assert_eq!(density, 7);
             }
@@ -495,6 +530,19 @@ mod tests {
         assert_eq!(heat, Some((1900, 1400)));
     }
 
+    /// `N` sets both trims; `BLACK:RED` drives them apart. The split form is the
+    /// whole point of the type — black and red live in different header fields.
+    #[test]
+    fn density_accepts_both_forms() {
+        assert_eq!(super::parse_density("6"), Ok(Density::uniform(6)));
+        assert_eq!(
+            super::parse_density("3:12"),
+            Ok(Density { black: 3, red: 12 })
+        );
+        assert!(super::parse_density("3:").is_err());
+        assert!(super::parse_density("x").is_err());
+    }
+
     #[test]
     fn heat_pair_needs_a_colon() {
         assert!(super::parse_heat_pair("1700").is_err());
@@ -523,7 +571,7 @@ mod tests {
             panic!("expected HeatSweep");
         };
         assert_eq!(heats, vec![(1700, 1200), (2500, 2000)]);
-        assert_eq!(densities, vec![0, 4, 8, 15]);
+        assert_eq!(densities, [0, 4, 8, 15].map(Density::uniform).to_vec());
     }
 
     /// Omitting --heat is what selects the three vendor presets at run time, so
@@ -538,6 +586,9 @@ mod tests {
             panic!("expected HeatSweep");
         };
         assert!(heats.is_empty());
-        assert_eq!(densities, vec![0, 2, 4, 6, 8, 10, 12, 15]);
+        assert_eq!(
+            densities,
+            [0, 2, 4, 6, 8, 10, 12, 15].map(Density::uniform).to_vec()
+        );
     }
 }

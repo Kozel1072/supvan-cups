@@ -8,7 +8,9 @@ use supvan_proto::bitmap::{
     DEFAULT_MARGIN_DOTS, DOTS_PER_MM, PRINTHEAD_BYTES_PER_LINE, PRINTHEAD_WIDTH_DOTS,
     center_in_printhead, create_test_pattern, raster_to_column_major,
 };
-use supvan_proto::buffer::{MAX_BUF_DATA, PRINT_BUF_HEADER, PRINT_BUF_SIZE, split_into_buffers};
+use supvan_proto::buffer::{
+    Density, MAX_BUF_DATA, PRINT_BUF_HEADER, PRINT_BUF_SIZE, split_into_buffers,
+};
 use supvan_proto::compress::{compress_buffers, decompress_lzma};
 
 // ---------------------------------------------------------------------------
@@ -67,7 +69,7 @@ fn run_pipeline(
         num_cols as u16,
         DEFAULT_MARGIN_DOTS,
         DEFAULT_MARGIN_DOTS,
-        4,
+        Density::uniform(4),
     );
 
     let (compressed, _avg) = compress_buffers(&buffers).unwrap();
@@ -204,7 +206,7 @@ fn test_full_pipeline_test_pattern() {
         height_dots as u16,
         DEFAULT_MARGIN_DOTS,
         DEFAULT_MARGIN_DOTS,
-        4,
+        Density::uniform(4),
     );
     assert_eq!(buffers.len(), 3);
 
@@ -260,7 +262,7 @@ fn test_pipeline_various_sizes() {
             num_cols as u16,
             DEFAULT_MARGIN_DOTS,
             DEFAULT_MARGIN_DOTS,
-            4,
+            Density::uniform(4),
         );
 
         // Verify expected buffer count

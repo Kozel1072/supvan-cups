@@ -68,6 +68,37 @@ pub fn build_page_reg_bits(p: &PageRegBits) -> [u8; 2] {
     [b0, b1]
 }
 
+/// The two independent burn-energy trims a print buffer carries.
+///
+/// The Android app keeps these as `mDeepness` / `mRedDeepness` and packs them
+/// into one int for transport as `(black << 8) | red`, unpacking when the value
+/// exceeds 255 (`T50PlusPrint.java:107-112`). They land in different places in
+/// the buffer header: black in the PAGE_REG_BITS `nodu` field, red in `buf[12]`.
+/// Its print-setup dialog exposes both as separate spinners, so they are meant
+/// to be driven independently — setting them equal is a special case, not the
+/// rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Density {
+    pub black: u8,
+    pub red: u8,
+}
+
+impl Density {
+    /// Both trims at the same value — the vendor's default shape (4/4).
+    pub fn uniform(value: u8) -> Self {
+        Self {
+            black: value,
+            red: value,
+        }
+    }
+}
+
+impl Default for Density {
+    fn default() -> Self {
+        Self::uniform(4)
+    }
+}
+
 /// Parameters for building a print buffer.
 pub struct PrintBufferParams<'a> {
     pub image_data: &'a [u8],
@@ -78,20 +109,20 @@ pub struct PrintBufferParams<'a> {
     pub prt_end: bool,
     pub margin_top: u16,
     pub margin_bottom: u16,
-    pub density: u8,
+    pub density: Density,
 }
 
 /// Build a 4096-byte print buffer.
 ///
 /// Layout:
 ///   [0..1]   Checksum (LE)
-///   [2..3]   PAGE_REG_BITS
+///   [2..3]   PAGE_REG_BITS (black density in the `nodu` field)
 ///   [4..5]   Column count (LE)
 ///   [6]      Bytes per line
 ///   [7]      Reserved (0)
 ///   [8..9]   Margin top (LE, 1-900 dots)
 ///   [10..11] Margin bottom (LE, 1-900 dots)
-///   [12]     Density / red deepness (0-15)
+///   [12]     Red deepness (0-15)
 ///   [13]     0
 ///   [14..]   Image data
 pub fn build_print_buffer(p: &PrintBufferParams) -> [u8; PRINT_BUF_SIZE] {
@@ -102,7 +133,7 @@ pub fn build_print_buffer(p: &PrintBufferParams) -> [u8; PRINT_BUF_SIZE] {
         page_st: p.page_st,
         page_end: p.page_end,
         prt_end: p.prt_end,
-        nodu: p.density,
+        nodu: p.density.black,
         mat: 1,
         ..Default::default()
     });
@@ -121,8 +152,8 @@ pub fn build_print_buffer(p: &PrintBufferParams) -> [u8; PRINT_BUF_SIZE] {
     buf[8..10].copy_from_slice(&mt.to_le_bytes());
     buf[10..12].copy_from_slice(&mb.to_le_bytes());
 
-    // Density
-    buf[12] = p.density.min(MAX_DENSITY);
+    // Red deepness — the black trim rides in PAGE_REG_BITS above, not here.
+    buf[12] = p.density.red.min(MAX_DENSITY);
 
     // Image data at offset 14
     let data_len = p.image_data.len().min(PRINT_BUF_SIZE - PRINT_BUF_HEADER);
@@ -152,7 +183,7 @@ pub fn build_print_buffer(p: &PrintBufferParams) -> [u8; PRINT_BUF_SIZE] {
 #[derive(Debug, Clone, Copy)]
 pub struct DensityBand {
     pub cols: u16,
-    pub density: u8,
+    pub density: Density,
 }
 
 /// Split column-major image data into print buffers, one density throughout.
@@ -164,7 +195,7 @@ pub fn split_into_buffers(
     total_cols: u16,
     margin_top: u16,
     margin_bottom: u16,
-    density: u8,
+    density: Density,
 ) -> Vec<[u8; PRINT_BUF_SIZE]> {
     let cols = total_cols - margin_top - margin_bottom;
     split_into_banded_buffers(
@@ -190,7 +221,7 @@ pub fn split_into_banded_buffers(
 
     // Resolve the full chunk list up front: page_end/prt_end must be set on the
     // final buffer, which isn't known until every band has been tiled.
-    let mut chunks: Vec<(u16, u16, u8)> = Vec::new();
+    let mut chunks: Vec<(u16, u16, Density)> = Vec::new();
     let mut current_col: u16 = 0;
     for band in bands {
         let mut cols_remaining = band.cols;
@@ -272,7 +303,7 @@ mod tests {
             prt_end: true,
             margin_top: 8,
             margin_bottom: 8,
-            density: 4,
+            density: Density::uniform(4),
         });
         // Verify buffer structure
         assert_eq!(buf[6], 48); // bytes per line
@@ -293,7 +324,14 @@ mod tests {
         let per_line_byte = 48u8;
         let total_cols = 240u16;
         let image_data = vec![0u8; total_cols as usize * per_line_byte as usize];
-        let bufs = split_into_buffers(&image_data, per_line_byte, total_cols, 8, 8, 4);
+        let bufs = split_into_buffers(
+            &image_data,
+            per_line_byte,
+            total_cols,
+            8,
+            8,
+            Density::uniform(4),
+        );
         assert_eq!(bufs.len(), 3);
     }
 
@@ -306,15 +344,15 @@ mod tests {
         let bands = [
             DensityBand {
                 cols: 40,
-                density: 2,
+                density: Density::uniform(2),
             },
             DensityBand {
                 cols: 40,
-                density: 9,
+                density: Density::uniform(9),
             },
             DensityBand {
                 cols: 40,
-                density: 15,
+                density: Density::uniform(15),
             },
         ];
         let bufs = split_into_banded_buffers(&image_data, per_line_byte, &bands, 8, 8);
@@ -334,7 +372,7 @@ mod tests {
         let image_data = vec![0u8; 400 * per_line_byte as usize];
         let bands = [DensityBand {
             cols: 200,
-            density: 7,
+            density: Density::uniform(7),
         }];
         let bufs = split_into_banded_buffers(&image_data, per_line_byte, &bands, 8, 8);
 
@@ -343,19 +381,40 @@ mod tests {
         assert_eq!(u16::from_le_bytes([bufs[2][4], bufs[2][5]]), 32);
     }
 
+    /// Black and red are separate knobs in separate header fields: black in the
+    /// PAGE_REG_BITS `nodu` bits, red in `buf[12]`. Driving them in lockstep was
+    /// the bug this type exists to prevent.
+    #[test]
+    fn black_and_red_land_in_different_fields() {
+        let data = vec![0u8; 84 * 48];
+        let buf = build_print_buffer(&PrintBufferParams {
+            image_data: &data,
+            per_line_byte: 48,
+            cols_in_buf: 84,
+            page_st: true,
+            page_end: true,
+            prt_end: true,
+            margin_top: 8,
+            margin_bottom: 8,
+            density: Density { black: 3, red: 12 },
+        });
+        assert_eq!(buf[12], 12); // red deepness
+        assert_eq!((buf[3] >> 2) & 0x0F, 3); // nodu = black
+    }
+
     /// The single-density entry point is the banded one with one band, so the
     /// two must agree exactly.
     #[test]
     fn plain_split_matches_single_band() {
         let per_line_byte = 48u8;
         let image_data = vec![0xA5u8; 240 * per_line_byte as usize];
-        let plain = split_into_buffers(&image_data, per_line_byte, 240, 8, 8, 4);
+        let plain = split_into_buffers(&image_data, per_line_byte, 240, 8, 8, Density::uniform(4));
         let banded = split_into_banded_buffers(
             &image_data,
             per_line_byte,
             &[DensityBand {
                 cols: 224,
-                density: 4,
+                density: Density::uniform(4),
             }],
             8,
             8,
