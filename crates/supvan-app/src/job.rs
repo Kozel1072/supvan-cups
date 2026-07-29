@@ -5,17 +5,30 @@ use ipp_printer_app::{JobFailure, JobOptions, PrinterHandle, PrinterReason, Rast
 use supvan_proto::bitmap::{DEFAULT_MARGIN_DOTS, center_in_printhead, raster_to_column_major};
 use supvan_proto::buffer::{ColourMode, Density, split_into_buffers};
 use supvan_proto::compress::compress_buffers;
+use supvan_proto::dither::{DitherMode, Ditherer};
 use supvan_proto::error::Error as ProtoError;
 use supvan_proto::speed::calc_speed;
 use supvan_proto::status::PrinterStatus;
 
-use crate::dither::dither_line;
 use crate::dump::{JobDump, JobManifest, PgmAccumulator, dumps_enabled};
 use crate::mock;
 use crate::printer_device::KsDevice;
 
 /// Maximum device print density; darkness (0-100%) scales onto 0..=MAX_DENSITY.
 const MAX_DENSITY: i32 = 15;
+
+/// Halftone kernel for 8bpp input, from `SUPVAN_DITHER` — the app takes all its
+/// other configuration from the environment too. Unrecognised values warn and
+/// fall back rather than failing a print.
+fn configured_dither() -> DitherMode {
+    let Ok(raw) = std::env::var("SUPVAN_DITHER") else {
+        return DitherMode::default();
+    };
+    raw.parse().unwrap_or_else(|e| {
+        log::warn!("SUPVAN_DITHER: {e}; using {:?}", DitherMode::default());
+        DitherMode::default()
+    })
+}
 
 /// Poll cadence and budget while waiting for print completion
 /// (COMPLETION_POLLS × COMPLETION_POLL_INTERVAL = 30s).
@@ -84,6 +97,7 @@ pub struct KsJob {
     pub density: u8,
     pub printhead_width_dots: u32,
     pub pgm_acc: Option<PgmAccumulator>,
+    ditherer: Ditherer,
 }
 
 impl KsJob {
@@ -95,8 +109,9 @@ impl KsJob {
         density: u8,
         printhead_width_dots: u32,
     ) -> Result<Self, JobFailure> {
+        let dither = configured_dither();
         log::info!(
-            "KsJob::start: {w}x{h}, bpl={bpl}, density={density}, printhead={printhead_width_dots}"
+            "KsJob::start: {w}x{h}, bpl={bpl}, density={density}, printhead={printhead_width_dots}, dither={dither:?}"
         );
         Ok(KsJob {
             width: w,
@@ -107,6 +122,7 @@ impl KsJob {
             density,
             printhead_width_dots,
             pgm_acc: None,
+            ditherer: Ditherer::new(dither, w),
         })
     }
 
@@ -291,7 +307,7 @@ impl RasterDriver for KsJob {
             }
             let bpl_1bpp = width.div_ceil(8) as usize;
             let mut mono = vec![0u8; bpl_1bpp];
-            dither_line(input, width, y, &mut mono);
+            self.ditherer.line(input, y, &mut mono);
             if !self.append_line(y, &mono) {
                 return Err(JobFailure::other(format!(
                     "write_line: y={y} out of bounds"

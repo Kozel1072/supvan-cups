@@ -237,6 +237,33 @@ pub fn create_swatch_ladder(
     (buf, height_dots, bytes_per_line, band_cols)
 }
 
+/// Build an 8bpp grayscale staircase for comparing halftone kernels.
+///
+/// `steps` bands from white to black down the feed direction. Since the printer
+/// is 1bpp, every intermediate tone is whatever the dither makes of it — which
+/// is exactly what this is for.
+///
+/// Returns `(gray, width_dots, height_dots)`, row-major W colorspace.
+pub fn create_gray_ramp(label_width_mm: u32, height_mm: u32, steps: u32) -> (Vec<u8>, u32, u32) {
+    let width = PRINTHEAD_WIDTH_DOTS;
+    let height = height_mm * DOTS_PER_MM;
+    let label_width_dots = (label_width_mm * DOTS_PER_MM).min(width);
+    let x0 = (width - label_width_dots) / 2;
+    let steps = steps.max(2);
+    let band = (height / steps).max(1);
+
+    let mut gray = vec![255u8; (width * height) as usize];
+    for y in 0..height {
+        let step = (y / band).min(steps - 1);
+        // White through black, so the top of the label is the lightest tone.
+        let level = 255 - (step * 255 / (steps - 1)).min(255);
+        let row = (y * width) as usize;
+        gray[row + x0 as usize..row + (x0 + label_width_dots) as usize].fill(level as u8);
+    }
+
+    (gray, width, height)
+}
+
 /// Which two-colour test card to generate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CardPattern {
@@ -354,6 +381,30 @@ pub fn create_two_colour_card(label_width_mm: u32, height_mm: u32) -> (Vec<u8>, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ramp must actually span white to black, or it tells us nothing about
+    /// the kernel under test.
+    #[test]
+    fn gray_ramp_spans_the_full_range() {
+        let (gray, w, h) = create_gray_ramp(34, 34, 8);
+        assert_eq!((w, h), (PRINTHEAD_WIDTH_DOTS, 34 * DOTS_PER_MM));
+
+        let centre = (w / 2) as usize;
+        let top = gray[centre];
+        let bottom = gray[((h - 1) * w) as usize + centre];
+        assert_eq!(top, 255, "first band should be white");
+        assert_eq!(bottom, 0, "last band should be black");
+    }
+
+    /// Outside the label width the ramp must stay blank, so the printhead
+    /// doesn't burn past the media edge.
+    #[test]
+    fn gray_ramp_leaves_margins_white() {
+        let (gray, w, h) = create_gray_ramp(20, 20, 4);
+        let last_row = ((h - 1) * w) as usize;
+        assert_eq!(gray[last_row], 255, "left margin should be white");
+        assert_eq!(gray[last_row + (w - 1) as usize], 255, "right margin");
+    }
 
     #[test]
     fn test_raster_to_column_major_simple() {

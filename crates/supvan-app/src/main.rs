@@ -12,7 +12,6 @@ mod battery_provider;
 mod ble_discover;
 mod device;
 mod discover;
-mod dither;
 mod dump;
 mod ipp_job;
 mod ipp_server;

@@ -17,6 +17,7 @@ pub mod buffer;
 pub mod cmd;
 pub mod compress;
 pub mod data;
+pub mod dither;
 pub mod error;
 pub mod hidraw;
 pub mod printer;

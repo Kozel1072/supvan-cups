@@ -438,6 +438,70 @@ impl Printer {
         self.print_compressed(&compressed, speed).await
     }
 
+    /// Print an 8bpp grayscale image, halftoned with `dither`.
+    ///
+    /// The printer has no grayscale mode — the raster is 1bpp — so tone is
+    /// entirely a product of the halftone kernel. `gray` is row-major
+    /// `width * height`, W colorspace (0 = black, 255 = white).
+    ///
+    /// This is the batch counterpart of the IPP path, which dithers
+    /// line-by-line as CUPS streams them. Both share [`crate::dither`].
+    pub async fn print_grayscale(
+        &self,
+        gray: &[u8],
+        width: u32,
+        height: u32,
+        density: Density,
+        dither: crate::dither::DitherMode,
+    ) -> Result<()> {
+        use crate::bitmap::{DEFAULT_MARGIN_DOTS, center_in_printhead, raster_to_column_major};
+        use crate::buffer::split_into_buffers;
+        use crate::compress::compress_buffers;
+        use crate::dither::Ditherer;
+
+        let expected = (width as usize) * (height as usize);
+        if gray.len() < expected {
+            return Err(Error::InvalidParam(format!(
+                "grayscale buffer too small: {} < {expected}",
+                gray.len()
+            )));
+        }
+
+        let bpl = width.div_ceil(8) as usize;
+        let mut mono = vec![0u8; bpl * height as usize];
+        let mut ditherer = Ditherer::new(dither, width);
+        for y in 0..height {
+            let row = &gray[(y * width) as usize..((y + 1) * width) as usize];
+            let out = &mut mono[y as usize * bpl..(y as usize + 1) * bpl];
+            ditherer.line(row, y, out);
+        }
+
+        let (col_data, num_cols, _) = raster_to_column_major(&mono, width, height);
+        let (canvas, canvas_bpl) = center_in_printhead(
+            &col_data,
+            num_cols,
+            width,
+            crate::bitmap::PRINTHEAD_WIDTH_DOTS,
+        );
+        let buffers = split_into_buffers(
+            &canvas,
+            canvas_bpl as u8,
+            num_cols as u16,
+            DEFAULT_MARGIN_DOTS,
+            DEFAULT_MARGIN_DOTS,
+            density,
+            ColourMode::Mono,
+        );
+        log::info!(
+            "grayscale: {width}x{height}, dither={dither:?}, density={density}, {} buffers",
+            buffers.len()
+        );
+
+        let (compressed, avg) = compress_buffers(&buffers)?;
+        let speed = calc_speed(avg);
+        self.print_compressed(&compressed, speed).await
+    }
+
     /// Print an RGB image in two-colour mode, red and black on one pass.
     ///
     /// `rgb` is row-major `width * height * 3`. Pixels are sorted into the two

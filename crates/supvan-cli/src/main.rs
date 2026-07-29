@@ -12,8 +12,11 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use supvan_proto::bitmap::{CardPattern, PRINTHEAD_WIDTH_MM, create_two_colour_pattern};
+use supvan_proto::bitmap::{
+    CardPattern, PRINTHEAD_WIDTH_MM, create_gray_ramp, create_two_colour_pattern,
+};
 use supvan_proto::buffer::Density;
+use supvan_proto::dither::DitherMode;
 use supvan_proto::printer::Printer;
 use supvan_proto::rfid::{RfidMaterial, heat_presets};
 use supvan_proto::status::{DEFAULT_LABEL_GAP_MM, DEFAULT_LABEL_HEIGHT_MM, MaterialInfo};
@@ -128,6 +131,28 @@ enum Command {
         /// red/black alternating, both colours on every line
         #[arg(long, value_parser = parse_pattern, default_value = "bars")]
         pattern: CardPattern,
+    },
+    /// Print a grayscale staircase through one halftone kernel. The printer is
+    /// 1bpp, so every intermediate tone is the dither's doing — this is how you
+    /// compare kernels on real stock.
+    GrayRamp {
+        /// Bluetooth address or /dev/hidrawN path
+        target: String,
+        /// Label width across the printhead, mm
+        #[arg(long, default_value_t = 40)]
+        width: u8,
+        /// Label length along the feed direction, mm
+        #[arg(long, default_value_t = 30)]
+        length: u8,
+        /// Halftone kernel
+        #[arg(long, default_value = "bayer")]
+        dither: DitherMode,
+        /// Grey steps from white to black
+        #[arg(long, default_value_t = 8)]
+        steps: u32,
+        /// Density as `N` or `BLACK:RED`
+        #[arg(long, value_parser = parse_density, default_value = "8")]
+        density: Density,
     },
     /// Scan for Supvan Bluetooth devices (via BlueZ D-Bus)
     Discover,
@@ -361,6 +386,28 @@ async fn cmd_provision(
     provision(&printer, &mat).await
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn cmd_gray_ramp(
+    target: &str,
+    width: u8,
+    length: u8,
+    dither: DitherMode,
+    steps: u32,
+    density: Density,
+) -> CliResult {
+    let printer = connect(target)?;
+    let (gray, w, h) = create_gray_ramp(width as u32, length as u32, steps);
+    eprintln!(
+        "Grey ramp on {width}mm x {length}mm: {steps} steps white->black, \
+dither={dither:?}, density={density}."
+    );
+    printer
+        .print_grayscale(&gray, w, h, density, dither)
+        .await?;
+    eprintln!("Done.");
+    Ok(())
+}
+
 /// Parse the test-card pattern name.
 fn parse_pattern(s: &str) -> Result<CardPattern, String> {
     match s {
@@ -503,6 +550,14 @@ async fn main() -> ExitCode {
             density,
             pattern,
         } => cmd_two_color(&target, width, length, density, pattern).await,
+        Command::GrayRamp {
+            target,
+            width,
+            length,
+            dither,
+            steps,
+            density,
+        } => cmd_gray_ramp(&target, width, length, dither, steps, density).await,
         Command::Discover => {
             cmd_discover();
             Ok(())
@@ -613,6 +668,27 @@ mod tests {
             panic!("expected Provision");
         };
         assert_eq!(code, 5618);
+    }
+
+    #[test]
+    fn parse_gray_ramp_dither_mode() {
+        let cli = Cli::try_parse_from([
+            "supvan-cli",
+            "gray-ramp",
+            "/dev/hidraw11",
+            "--dither",
+            "atkinson",
+            "--steps",
+            "12",
+        ])
+        .unwrap();
+        let Command::GrayRamp { dither, steps, .. } = cli.command else {
+            panic!("expected GrayRamp");
+        };
+        assert_eq!(dither, supvan_proto::dither::DitherMode::Atkinson);
+        assert_eq!(steps, 12);
+
+        assert!(Cli::try_parse_from(["supvan-cli", "gray-ramp", "x", "--dither", "nope"]).is_err());
     }
 
     #[test]
