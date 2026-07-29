@@ -110,7 +110,10 @@ async fn scan() -> bluer::Result<Vec<BleCandidate>> {
                 .any(|u| chars_for_service(*u).is_some());
             if advertises_gatt && is_supvan_ble(&astr, &name) && seen.insert(astr.clone()) {
                 log::info!("ble_discover: found {name} ({astr})");
-                out.push(BleCandidate { address: astr, name });
+                out.push(BleCandidate {
+                    address: astr,
+                    name,
+                });
             }
         }
         Ok::<(), bluer::Error>(())

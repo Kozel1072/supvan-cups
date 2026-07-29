@@ -264,6 +264,42 @@ pub fn create_gray_ramp(label_width_mm: u32, height_mm: u32, steps: u32) -> (Vec
     (gray, width, height)
 }
 
+/// Build **vertical** grey bands — each band a different tone, side by side
+/// across the printhead.
+///
+/// The counterpart to [`create_gray_ramp`], which runs down the feed axis. On
+/// two-colour stock the tone reached by a given dot coverage also decides the
+/// *colour*: sparse dots cool between firings and develop red, dense ones
+/// reinforce each other and go black. Because that is a property of the bitmap
+/// rather than the buffer header, it varies freely within a printhead line —
+/// unlike heat time or the density trims.
+///
+/// Returns `(gray, width_dots, height_dots)`, row-major W colorspace.
+pub fn create_gray_bands(label_width_mm: u32, height_mm: u32, bands: u32) -> (Vec<u8>, u32, u32) {
+    let width = PRINTHEAD_WIDTH_DOTS;
+    let height = height_mm * DOTS_PER_MM;
+    let label_width_dots = (label_width_mm * DOTS_PER_MM).min(width);
+    let x0 = (width - label_width_dots) / 2;
+    let bands = bands.max(2);
+    let band_dots = (label_width_dots / bands).max(1);
+
+    // Leave the extreme rows blank so the gap sensor still sees clean edges.
+    let ink_rows = height / 8..height * 7 / 8;
+
+    let mut gray = vec![255u8; (width * height) as usize];
+    for band in 0..bands {
+        // White through black across the head.
+        let level = (255 - (band * 255 / (bands - 1)).min(255)) as u8;
+        let from = x0 + band * band_dots;
+        for y in ink_rows.clone() {
+            let row = (y * width) as usize;
+            gray[row + from as usize..row + (from + band_dots) as usize].fill(level);
+        }
+    }
+
+    (gray, width, height)
+}
+
 /// Which two-colour test card to generate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CardPattern {
