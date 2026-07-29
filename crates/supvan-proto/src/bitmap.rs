@@ -195,6 +195,48 @@ pub fn create_test_pattern(label_width_mm: u32, height_mm: u32) -> (Vec<u8>, u32
     (buf, canvas_width_dots, height_dots, bytes_per_line)
 }
 
+/// Unprinted trailing columns in each swatch band, so neighbouring bands that
+/// happen to burn the same shade are still countable.
+const SWATCH_SEPARATOR_DOTS: u32 = 4;
+
+/// Build a calibration strip: `steps` solid blocks laid down the feed
+/// direction, each to be printed at its own density.
+///
+/// Bands are equal-width and in order, so a band's position identifies which
+/// density produced it — there is no font in this crate to label them with.
+///
+/// Returns `(image_bytes, height_dots, bytes_per_line, band_cols)`; feed
+/// `band_cols` back into a [`DensityBand`](crate::buffer::DensityBand) per step
+/// so the buffer split lines up with the ink.
+pub fn create_swatch_ladder(
+    label_width_mm: u32,
+    height_mm: u32,
+    steps: u32,
+) -> (Vec<u8>, u32, u32, u32) {
+    let bytes_per_line = PRINTHEAD_BYTES_PER_LINE;
+    let height_dots = height_mm * DOTS_PER_MM;
+    let label_width_dots = (label_width_mm * DOTS_PER_MM).min(PRINTHEAD_WIDTH_DOTS);
+    let x_offset = (PRINTHEAD_WIDTH_DOTS - label_width_dots) / 2;
+
+    let margin = DEFAULT_MARGIN_DOTS as u32;
+    let printable = height_dots.saturating_sub(2 * margin);
+    let band_cols = printable / steps.max(1);
+    let ink_cols = band_cols.saturating_sub(SWATCH_SEPARATOR_DOTS);
+
+    let mut buf = vec![0u8; bytes_per_line as usize * height_dots as usize];
+    for step in 0..steps {
+        let start = margin + step * band_cols;
+        for col in start..start + ink_cols {
+            for dot in x_offset..x_offset + label_width_dots {
+                let byte_idx = col as usize * bytes_per_line as usize + (dot / 8) as usize;
+                buf[byte_idx] |= 1 << (dot % 8); // LSB-first
+            }
+        }
+    }
+
+    (buf, height_dots, bytes_per_line, band_cols)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

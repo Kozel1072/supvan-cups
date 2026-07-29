@@ -143,7 +143,19 @@ pub fn build_print_buffer(p: &PrintBufferParams) -> [u8; PRINT_BUF_SIZE] {
     buf
 }
 
-/// Split column-major image data into multiple print buffers.
+/// A run of feed-direction columns printed at its own density.
+///
+/// Density is a per-buffer field, and buffers tile the label along the feed
+/// axis, so energy can vary from one stripe of the label to the next — but
+/// never within a printhead line. That is the whole extent of the protocol's
+/// per-area energy control; there is no per-dot equivalent.
+#[derive(Debug, Clone, Copy)]
+pub struct DensityBand {
+    pub cols: u16,
+    pub density: u8,
+}
+
+/// Split column-major image data into print buffers, one density throughout.
 ///
 /// Returns a Vec of 4096-byte print buffers ready for LZMA compression.
 pub fn split_into_buffers(
@@ -154,38 +166,66 @@ pub fn split_into_buffers(
     margin_bottom: u16,
     density: u8,
 ) -> Vec<[u8; PRINT_BUF_SIZE]> {
+    let cols = total_cols - margin_top - margin_bottom;
+    split_into_banded_buffers(
+        image_data,
+        per_line_byte,
+        &[DensityBand { cols, density }],
+        margin_top,
+        margin_bottom,
+    )
+}
+
+/// Split column-major image data into print buffers, giving each band its own
+/// density. Bands are laid down the feed direction in order; a band larger than
+/// one buffer's capacity is split across several, all keeping its density.
+pub fn split_into_banded_buffers(
+    image_data: &[u8],
+    per_line_byte: u8,
+    bands: &[DensityBand],
+    margin_top: u16,
+    margin_bottom: u16,
+) -> Vec<[u8; PRINT_BUF_SIZE]> {
     let max_cols = (MAX_BUF_DATA / per_line_byte as usize) as u16;
-    let image_cols = total_cols - margin_top - margin_bottom;
-    let mut buffers = Vec::new();
-    let mut cols_remaining = image_cols;
+
+    // Resolve the full chunk list up front: page_end/prt_end must be set on the
+    // final buffer, which isn't known until every band has been tiled.
+    let mut chunks: Vec<(u16, u16, u8)> = Vec::new();
     let mut current_col: u16 = 0;
-
-    while cols_remaining > 0 {
-        let cols_in_buf = cols_remaining.min(max_cols);
-        let is_first = current_col == 0;
-        let is_last = cols_remaining <= max_cols;
-
-        let img_start = (margin_top + current_col) as usize * per_line_byte as usize;
-        let img_end = img_start + cols_in_buf as usize * per_line_byte as usize;
-        let img_chunk = &image_data[img_start..img_end.min(image_data.len())];
-
-        let buf = build_print_buffer(&PrintBufferParams {
-            image_data: img_chunk,
-            per_line_byte,
-            cols_in_buf,
-            page_st: is_first,
-            page_end: is_last,
-            prt_end: is_last,
-            margin_top,
-            margin_bottom,
-            density,
-        });
-        buffers.push(buf);
-        current_col += cols_in_buf;
-        cols_remaining -= cols_in_buf;
+    for band in bands {
+        let mut cols_remaining = band.cols;
+        while cols_remaining > 0 {
+            let cols_in_buf = cols_remaining.min(max_cols);
+            chunks.push((current_col, cols_in_buf, band.density));
+            current_col += cols_in_buf;
+            cols_remaining -= cols_in_buf;
+        }
     }
 
-    buffers
+    let last = chunks.len().saturating_sub(1);
+    chunks
+        .iter()
+        .enumerate()
+        .map(|(i, &(start_col, cols_in_buf, density))| {
+            let img_start = (margin_top + start_col) as usize * per_line_byte as usize;
+            let img_end = img_start + cols_in_buf as usize * per_line_byte as usize;
+            let img_chunk = image_data
+                .get(img_start..img_end.min(image_data.len()))
+                .unwrap_or(&[]);
+
+            build_print_buffer(&PrintBufferParams {
+                image_data: img_chunk,
+                per_line_byte,
+                cols_in_buf,
+                page_st: i == 0,
+                page_end: i == last,
+                prt_end: i == last,
+                margin_top,
+                margin_bottom,
+                density,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -255,5 +295,71 @@ mod tests {
         let image_data = vec![0u8; total_cols as usize * per_line_byte as usize];
         let bufs = split_into_buffers(&image_data, per_line_byte, total_cols, 8, 8, 4);
         assert_eq!(bufs.len(), 3);
+    }
+
+    /// Each band's density must land in its own buffer header, and only the
+    /// first/last buffer of the whole strip carry the page flags.
+    #[test]
+    fn banded_split_keeps_per_band_density() {
+        let per_line_byte = 48u8;
+        let image_data = vec![0u8; 240 * per_line_byte as usize];
+        let bands = [
+            DensityBand {
+                cols: 40,
+                density: 2,
+            },
+            DensityBand {
+                cols: 40,
+                density: 9,
+            },
+            DensityBand {
+                cols: 40,
+                density: 15,
+            },
+        ];
+        let bufs = split_into_banded_buffers(&image_data, per_line_byte, &bands, 8, 8);
+
+        assert_eq!(bufs.len(), 3);
+        assert_eq!([bufs[0][12], bufs[1][12], bufs[2][12]], [2, 9, 15]);
+        // PageSt (0x02) on the first only; PageEnd|PrtEnd (0x0C) on the last only.
+        assert_eq!(bufs[0][2] & 0x02, 0x02);
+        assert_eq!(bufs[1][2] & 0x0E, 0);
+        assert_eq!(bufs[2][2] & 0x0C, 0x0C);
+    }
+
+    /// A band wider than one buffer splits, and every piece keeps its density.
+    #[test]
+    fn banded_split_subdivides_oversized_band() {
+        let per_line_byte = 48u8; // max_cols = 4074/48 = 84
+        let image_data = vec![0u8; 400 * per_line_byte as usize];
+        let bands = [DensityBand {
+            cols: 200,
+            density: 7,
+        }];
+        let bufs = split_into_banded_buffers(&image_data, per_line_byte, &bands, 8, 8);
+
+        assert_eq!(bufs.len(), 3); // 84 + 84 + 32
+        assert!(bufs.iter().all(|b| b[12] == 7));
+        assert_eq!(u16::from_le_bytes([bufs[2][4], bufs[2][5]]), 32);
+    }
+
+    /// The single-density entry point is the banded one with one band, so the
+    /// two must agree exactly.
+    #[test]
+    fn plain_split_matches_single_band() {
+        let per_line_byte = 48u8;
+        let image_data = vec![0xA5u8; 240 * per_line_byte as usize];
+        let plain = split_into_buffers(&image_data, per_line_byte, 240, 8, 8, 4);
+        let banded = split_into_banded_buffers(
+            &image_data,
+            per_line_byte,
+            &[DensityBand {
+                cols: 224,
+                density: 4,
+            }],
+            8,
+            8,
+        );
+        assert_eq!(plain, banded);
     }
 }

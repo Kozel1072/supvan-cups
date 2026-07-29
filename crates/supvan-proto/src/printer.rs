@@ -368,4 +368,56 @@ impl Printer {
 
         self.print_compressed(&compressed, speed).await
     }
+
+    /// Print one calibration strip: a solid block per entry in `densities`, laid
+    /// down the feed direction in order, each burned at its own density.
+    ///
+    /// Pair with [`set_rfid_data`](Self::set_rfid_data) to vary the heat times
+    /// between strips: heat time sets the absolute energy, density trims it, and
+    /// on energy-selected two-colour stock the pair decides which colour
+    /// develops.
+    pub async fn print_swatch_ladder(
+        &self,
+        label_width_mm: u32,
+        height_mm: u32,
+        densities: &[u8],
+    ) -> Result<()> {
+        use crate::bitmap::create_swatch_ladder;
+        use crate::buffer::{DensityBand, split_into_banded_buffers};
+        use crate::compress::compress_buffers;
+
+        if densities.is_empty() {
+            return Err(Error::InvalidParam("no densities to sweep".into()));
+        }
+        let steps = densities.len() as u32;
+        let (image_data, _h, bpl, band_cols) =
+            create_swatch_ladder(label_width_mm, height_mm, steps);
+        if band_cols == 0 {
+            return Err(Error::InvalidParam(format!(
+                "{height_mm}mm label too short for {steps} bands"
+            )));
+        }
+
+        let bands: Vec<DensityBand> = densities
+            .iter()
+            .map(|&density| DensityBand {
+                cols: band_cols as u16,
+                density,
+            })
+            .collect();
+        let margin = crate::bitmap::DEFAULT_MARGIN_DOTS;
+        let buffers = split_into_banded_buffers(&image_data, bpl as u8, &bands, margin, margin);
+        log::info!(
+            "swatch ladder: {}mm x {}mm, {} bands of {} cols, densities={:?}",
+            label_width_mm,
+            height_mm,
+            steps,
+            band_cols,
+            densities
+        );
+
+        let (compressed, avg) = compress_buffers(&buffers)?;
+        let speed = calc_speed(avg);
+        self.print_compressed(&compressed, speed).await
+    }
 }
