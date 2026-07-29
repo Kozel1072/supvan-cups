@@ -237,6 +237,72 @@ pub fn create_swatch_ladder(
     (buf, height_dots, bytes_per_line, band_cols)
 }
 
+/// Which two-colour test card to generate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CardPattern {
+    /// Horizontal bars: thick red above thin black. Each printhead line holds
+    /// one colour, so this works even if the printer only varies energy along
+    /// the feed axis.
+    Bars,
+    /// Vertical stripes alternating red and black across the head. **Every
+    /// printhead line contains both colours**, which nothing but genuine
+    /// two-plane support can produce — banding by feed-direction energy cannot.
+    Stripes,
+}
+
+/// Build an RGB test card for two-colour mode.
+///
+/// [`Stripes`](CardPattern::Stripes) is the decisive one: red and black on the
+/// same line is exactly what per-band energy control cannot do, so if the
+/// stripes come out in two colours the firmware is genuinely burning the two
+/// planes at different trims.
+///
+/// Returns `(rgb, width_dots, height_dots)`, row-major RGB across the full
+/// printhead with the label content centred.
+pub fn create_two_colour_pattern(
+    label_width_mm: u32,
+    height_mm: u32,
+    pattern: CardPattern,
+) -> (Vec<u8>, u32, u32) {
+    match pattern {
+        CardPattern::Bars => create_two_colour_card(label_width_mm, height_mm),
+        CardPattern::Stripes => create_two_colour_stripes(label_width_mm, height_mm),
+    }
+}
+
+/// Vertical red/black stripes: four bars across the head, spanning the middle
+/// of the label so the gap sensor sees clean leading and trailing edges.
+fn create_two_colour_stripes(label_width_mm: u32, height_mm: u32) -> (Vec<u8>, u32, u32) {
+    const RED: [u8; 3] = [255, 0, 0];
+    const BLACK: [u8; 3] = [0, 0, 0];
+    /// Alternating stripes across the head; even ones red, odd ones black.
+    const STRIPES: u32 = 4;
+
+    let width = PRINTHEAD_WIDTH_DOTS;
+    let height = height_mm * DOTS_PER_MM;
+    let label_width_dots = (label_width_mm * DOTS_PER_MM).min(width);
+    let x0 = (width - label_width_dots) / 2;
+    let stripe_dots = label_width_dots / STRIPES;
+
+    let ink_rows = height / 6..height * 5 / 6;
+
+    let mut rgb = vec![255u8; (width * height * 3) as usize];
+    for y in ink_rows {
+        for s in 0..STRIPES {
+            let colour = if s % 2 == 0 { RED } else { BLACK };
+            let from = x0 + s * stripe_dots;
+            // Leave a 4-dot unprinted alley so neighbouring stripes can't be
+            // merged by lateral heat bleed into looking like one colour.
+            for x in from..from + stripe_dots.saturating_sub(4) {
+                let px = ((y * width + x) * 3) as usize;
+                rgb[px..px + 3].copy_from_slice(&colour);
+            }
+        }
+    }
+
+    (rgb, width, height)
+}
+
 /// Build an RGB test card for two-colour mode: a thick red bar above a thin
 /// black bar.
 ///

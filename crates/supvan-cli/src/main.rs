@@ -12,7 +12,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use supvan_proto::bitmap::{PRINTHEAD_WIDTH_MM, create_two_colour_card};
+use supvan_proto::bitmap::{CardPattern, PRINTHEAD_WIDTH_MM, create_two_colour_pattern};
 use supvan_proto::buffer::Density;
 use supvan_proto::printer::Printer;
 use supvan_proto::rfid::{RfidMaterial, heat_presets};
@@ -124,6 +124,10 @@ enum Command {
         /// Density as `N` or `BLACK:RED`
         #[arg(long, value_parser = parse_density, default_value = "8:4")]
         density: Density,
+        /// `bars` = red above black (one colour per line); `stripes` = vertical
+        /// red/black alternating, both colours on every line
+        #[arg(long, value_parser = parse_pattern, default_value = "bars")]
+        pattern: CardPattern,
     },
     /// Scan for Supvan Bluetooth devices (via BlueZ D-Bus)
     Discover,
@@ -357,16 +361,41 @@ async fn cmd_provision(
     provision(&printer, &mat).await
 }
 
-async fn cmd_two_color(target: &str, width: u8, length: u8, density: Density) -> CliResult {
-    let printer = connect(target)?;
-    let (rgb, w, h) = create_two_colour_card(width as u32, length as u32);
+/// Parse the test-card pattern name.
+fn parse_pattern(s: &str) -> Result<CardPattern, String> {
+    match s {
+        "bars" => Ok(CardPattern::Bars),
+        "stripes" => Ok(CardPattern::Stripes),
+        other => Err(format!("unknown pattern `{other}` (bars|stripes)")),
+    }
+}
 
-    eprintln!(
-        "Two-colour card on {width}mm x {length}mm: thick RED bar above a thin BLACK bar, \
+async fn cmd_two_color(
+    target: &str,
+    width: u8,
+    length: u8,
+    density: Density,
+    pattern: CardPattern,
+) -> CliResult {
+    let printer = connect(target)?;
+    let (rgb, w, h) = create_two_colour_pattern(width as u32, length as u32, pattern);
+
+    match pattern {
+        CardPattern::Bars => eprintln!(
+            "Bars on {width}mm x {length}mm: thick RED above thin BLACK, black={} red={}.",
+            density.black, density.red
+        ),
+        CardPattern::Stripes => {
+            eprintln!(
+                "Stripes on {width}mm x {length}mm: 4 vertical bars, RED BLACK RED BLACK, \
 black={} red={}.",
-        density.black, density.red
-    );
-    eprintln!("If the thick bar prints black, the firmware's plane order is the reverse of ours.");
+                density.black, density.red
+            );
+            eprintln!(
+                "Both colours share every printhead line — only real two-plane support can do this."
+            );
+        }
+    }
     printer.print_two_colour(&rgb, w, h, density).await?;
     eprintln!("Done.");
     Ok(())
@@ -401,12 +430,16 @@ async fn cmd_heat_sweep(
     for (i, heat) in heats.iter().enumerate() {
         let mat = build_material(label, *heat, 480, 1, 30000);
         eprintln!(
-            "\nStrip {}/{}: heat5={} heat40={}, densities {:?}",
+            "\nStrip {}/{}: heat5={} heat40={}, densities {}",
             i + 1,
             heats.len(),
             heat.0,
             heat.1,
             densities
+                .iter()
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
         );
         provision(&printer, &mat).await?;
         printer
@@ -468,7 +501,8 @@ async fn main() -> ExitCode {
             width,
             length,
             density,
-        } => cmd_two_color(&target, width, length, density).await,
+            pattern,
+        } => cmd_two_color(&target, width, length, density, pattern).await,
         Command::Discover => {
             cmd_discover();
             Ok(())

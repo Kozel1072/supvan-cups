@@ -99,6 +99,18 @@ impl Default for Density {
     }
 }
 
+impl std::fmt::Display for Density {
+    /// Round-trips the CLI's `N` / `BLACK:RED` forms, so logged sweep settings
+    /// can be pasted straight back into a command.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.black == self.red {
+            write!(f, "{}", self.black)
+        } else {
+            write!(f, "{}:{}", self.black, self.red)
+        }
+    }
+}
+
 /// How many bitplanes each printed column carries.
 ///
 /// [`TwoColour`](ColourMode::TwoColour) doubles the data: every column ships a
