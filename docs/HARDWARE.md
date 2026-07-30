@@ -33,7 +33,7 @@ part.
   to be there — the YC3121 has 512 KB/1 MB of on-chip flash, ample for this
   firmware, so there is probably no separate flash chip to clip.
 
-## Firmware is not extractable in practice
+## Firmware: locked *in capability*, but shipped state unknown — worth a probe
 
 `PROTOCOL.md` flags two things that only firmware would settle: the real
 `PWD`/`PACK` derivation for consumable tags (the host code's
@@ -41,26 +41,41 @@ part.
 carries a non-zero signature in `MaterialInfo::code`, which
 `supvan-app::record_is_ours` assumes.
 
-**The datasheet makes reading that firmware impractical**, and it is worth being
-concrete about why so nobody sinks time into it:
+The SoC *can* be locked down hard: flash is on-chip "secure" (no external flash
+to clip), boot runs from ROM with **RSA signature verification** of firmware, a
+full crypto block (AES/DES/SM4/RSA/SHA/TRNG) and an MPU sit behind it, and the
+debug port is a **受控 JTAG ("controlled JTAG")** whose enable state and the OTP
+protection bits are held in **8 KB one-way fuse OTP**, locked by ROM.
 
-- Flash is **on-chip and "secure"** — there is no external flash to clip, which
-  was the only cheap, non-destructive route.
-- The debug port is a **受控 JTAG ("controlled JTAG")**: access is gated, not
-  open. Boot runs from ROM and the SoC does **RSA signature verification of the
-  firmware at download and at boot**, with a full crypto block (AES, DES, SM4,
-  RSA, SHA, TRNG) and an MPU behind it.
-- Protection state and debug-enable live in **8 KB OTP, fuse-based**, locked by
-  ROM during the debug/production phase. OTP is one-way: once burned, there is no
-  reverting it, and no way to read behind it after lock.
+**But the datasheet never states the shipped state.** "Controlled JTAG" is the
+*ability* to gate debug, not evidence Supvan engaged it — and unblown debug fuses
+on Yichip parts are not rare. Whether this unit is locked is a per-unit fact only
+a probe reveals.
 
-So the realistic options are all poor: the controlled-JTAG port likely refuses a
-readout on a production unit, and forcing it — where even possible — risks
-tripping OTP/anti-tamper and bricking the printer. This is a much harder target
-than the earlier "clip the SPI flash" hope assumed. **Treat both unverified items
-as staying unverified**; the `record_is_ours` assumption should be revisited only
-if a genuine roll ever misbehaves against it in practice, not by firmware
-extraction.
+**A read-only probe is low-risk to the hardware**, which an earlier revision of
+this file got wrong:
+
+- **OTP cannot self-burn during a readout.** Fuses program by oxide breakdown and
+  need **external 6.5 V DC on the VPP pin (pin 50)** to write (datasheet §7.1). No
+  VPP supply, no fuse change — a passive read cannot trip OTP or anti-tamper.
+- A locked controlled-JTAG **refuses**; it does not damage. Worst case you learn
+  nothing.
+- The hazard is *writes* — erase / reflash — not reads. A probe that only reads
+  IDCODE, halts the core and dumps memory risks nothing.
+
+Two access surfaces to try, neither needing VPP:
+
+1. **SWD on GPIO14 (`SWCLK`) / GPIO15 (`SWDIO`)** — the 5-pad port. Attach, read
+   IDCODE, attempt to halt and read flash.
+2. **ROM UART bootloader on GPIO0 (`RX`) / GPIO1 (`TX`)** (pins 35/37). A serial
+   boot path whose readback may be gated differently from JTAG; worth probing
+   independently.
+
+So this is worth an attempt after all, provided it stays read-only: **do not
+drive VPP, issue no flash writes or erases.** If either surface reads flash, both
+`PROTOCOL.md` unknowns are answerable. If both refuse, the unit is locked and the
+items stay unverified — `record_is_ours` then revisited only if a genuine roll
+ever misbehaves against it in practice.
 
 ## Datasheet
 
