@@ -1,14 +1,15 @@
 # Supvan T50M Pro — board survey
 
 Chip markings read off the PCB by hand (2026-07-30), one side only. Markings are
-verbatim; identifications are inference and each carries its confidence. Nothing
-here is from a datasheet we hold — see "Datasheet availability" below.
+verbatim. The YC3121 identification is now confirmed against its datasheet
+(`datasheets/YC3121-L_C2916799.pdf`); the rest remain inference at the stated
+confidence.
 
 ## Chips
 
 | Marking | Identification | Confidence |
 |---------|----------------|-----------|
-| `YC3121-L` / `EN1227` / `2406NDGF` | **Yichip YC3121 — Bluetooth 5.0 SoC**, QFN-56-EP(7×7), JLCPCB `C2916799`. Given the printer speaks BT Classic RFCOMM/SPP *and* BLE GATT, and nothing else on this side is a radio, this is the Bluetooth part and very likely the application processor. | medium-high on the part; role inferred |
+| `YC3121-L` / `EN1227` / `2406NDGF` | **Yichip YC3121-L — dual-mode Bluetooth 5.0 SoC (BR/EDR + BLE)**, QFN-56-EP(7×7), JLCPCB `C2916799`. **Confirmed by datasheet.** 32-bit RISC core (≤96 MHz, MPU), 64 KB scrambled SRAM, 512 KB/1 MB on-chip **secure** flash, 8 KB OTP, USB, 2×UART, 2×SPI + QSPI, IIC, 40 GPIO, hardware AES/DES/SM4/RSA/SHA/TRNG. This is the application processor and the radio both. | confirmed |
 | `AT8833` / `EC43BAY` | Dual H-bridge motor driver, DRV8833-compatible — the paper-feed stepper. | medium |
 | `RU30L15H` / `001 QAE49` | Power MOSFET, likely N-channel ~30 V logic-level (`RU` = Ruichips; `30`/`L` decode as voltage class and logic-level gate on their scheme). Switching a heavy rail: printhead or motor supply. A thermal head draws several amps in bursts. | medium — a *decode of the naming convention*, not a datasheet lookup |
 | `YCF5018` / `HQ7552` / `2403NA TD` | **Unidentified.** `YC` prefix hints at Yichip again but `F5018` doesn't place. By role, a battery-powered thermal printer wants a Li-ion charger, a printhead-rail converter, or a printhead driver — reasoning from need, not from the marking. | low — do not rely |
@@ -17,59 +18,54 @@ here is from a datasheet we hold — see "Datasheet availability" below.
 `2403` / `2406` fit a 2024 date-code pattern, consistent with the unit serial
 `T0117A24…` and the `20230412` firmware date.
 
-**5-pad port beside the YC3121** — pad count fits SWD as
-`SWDIO / SWCLK / nRST / VCC / GND`. JTAG needs four signals plus power, so five
-pads is tight for JTAG and natural for SWD.
+**5-pad port beside the YC3121 is JTAG/SWD.** The datasheet puts the debug pins on
+GPIO14 (`JTAG_SW_CLK` / `SWCLK`) and GPIO15 (`JTAG_SW_IO` / `SWDIO`) — a
+serial-wire two-wire port, so `SWDIO / SWCLK / nRST / VCC / GND` is the expected
+5-pad breakout. But see the security note: getting to the pins is not the hard
+part.
 
 ## Not yet located
 
 - **Any NFC front-end.** The consumable tags are ISO 14443-A (see
-  `PROTOCOL.md`), so something drives them. An earlier revision of these notes
-  wrongly attributed that to the YC3121; it may be `YCF5018` or `AWFGJE`, or on
-  the other side of the board.
-- **External SPI flash** (SOIC-8 / USON-8, `25Q…`-style marking). Its presence or
-  absence decides how firmware could be read — see below.
-- The reverse side of the board was not surveyed.
+  `PROTOCOL.md`), so something drives them. The YC3121 has no NFC block, so it is
+  one of the two unidentified parts (`YCF5018` / `AWFGJE`) or on the reverse side.
+- The reverse side of the board was not surveyed. External SPI flash is unlikely
+  to be there — the YC3121 has 512 KB/1 MB of on-chip flash, ample for this
+  firmware, so there is probably no separate flash chip to clip.
 
-## Why the firmware matters
+## Firmware is not extractable in practice
 
-`PROTOCOL.md` flags two things as unverified, and both are answered by firmware:
+`PROTOCOL.md` flags two things that only firmware would settle: the real
+`PWD`/`PACK` derivation for consumable tags (the host code's
+`SHA-256(UID ‖ Pwkey)` is commented out as broken), and whether a genuine tag
+carries a non-zero signature in `MaterialInfo::code`, which
+`supvan-app::record_is_ours` assumes.
 
-- the real `PWD`/`PACK` derivation for consumable tags — the vendor's host code
-  has `SHA-256(UID ‖ Pwkey)` but commented out, with its author's note that the
-  algorithm "has a problem", so the working version exists only in firmware
-- whether a genuine tag carries a non-zero signature in `MaterialInfo::code`,
-  which `supvan-app::record_is_ours` assumes when it refuses to overwrite a roll
+**The datasheet makes reading that firmware impractical**, and it is worth being
+concrete about why so nobody sinks time into it:
 
-Order of preference for any attempt, cheapest and safest first:
+- Flash is **on-chip and "secure"** — there is no external flash to clip, which
+  was the only cheap, non-destructive route.
+- The debug port is a **受控 JTAG ("controlled JTAG")**: access is gated, not
+  open. Boot runs from ROM and the SoC does **RSA signature verification of the
+  firmware at download and at boot**, with a full crypto block (AES, DES, SM4,
+  RSA, SHA, TRNG) and an MPU behind it.
+- Protection state and debug-enable live in **8 KB OTP, fuse-based**, locked by
+  ROM during the debug/production phase. OTP is one-way: once burned, there is no
+  reverting it, and no way to read behind it after lock.
 
-1. **Find external SPI flash and clip it.** Non-destructive, no unlock needed.
-2. Failing that, SWD on the YC3121 — after confirming its unlock semantics.
-   Read-out protection is likely and on many SoCs a forced unlock mass-erases
-   flash. Bricking the printer is a bad trade for a question we can leave open.
+So the realistic options are all poor: the controlled-JTAG port likely refuses a
+readout on a production unit, and forcing it — where even possible — risks
+tripping OTP/anti-tamper and bricking the printer. This is a much harder target
+than the earlier "clip the SPI flash" hope assumed. **Treat both unverified items
+as staying unverified**; the `record_is_ours` assumption should be revisited only
+if a genuine roll ever misbehaves against it in practice, not by firmware
+extraction.
 
-Note that Yichip's *other* BLE family, YC16xx, is 32-bit RISC-V and advertises
-firmware encryption. Different family, so it says nothing definite about the
-3121 — but "probably ARM" is a poor default for this vendor.
+## Datasheet
 
-## Datasheet availability
-
-**We do not have a YC3121 datasheet.** Every public route was tried and failed:
-
-| Route | Outcome |
-|---|---|
-| JLCPCB datasheet link for `C2916799` | 403 — Alibaba OSS bucket ACL, with and without referer/UA |
-| manuals.plus "YC3121 Bluetooth MCU Product Brief" | 403 — Cloudflare challenge |
-| chipspulse / smbom part pages | content-free stubs, no PDF |
-| LCSC `C2916799` | 404 — JLC-only part number |
-| `yichip.com.cn` | domain parked and for sale; vendor site gone |
-| `github.com/Yichip-Microelectronics/YC3121` | empty repo, 8-byte README, untouched since 2021 |
-
-The JLCPCB link is likely reachable from a logged-in session, which is the most
-promising way to obtain it:
-<https://jlcpcb.com/partdetail/YICHIP-YC3121L/C2916799>
-
-Everything above about the YC3121 therefore rests on distributor metadata
-(package, category, part number) plus inference from what the printer does — not
-on a datasheet. Treat the core architecture, memory sizes and debug interface as
-**unknown**, not as stated facts.
+`datasheets/YC3121-L_C2916799.pdf` — Yichip YC3121-L chip datasheet, V1.0
+(2021-04-01), 82 pages, Chinese. Obtained from a logged-in JLCPCB session after
+every anonymous route failed (OSS bucket ACL, Cloudflare, dead vendor domain,
+empty GitHub repo). Marked "Confidential and Proprietary" by Yichip; kept in-tree
+as the authoritative reference for this board.
