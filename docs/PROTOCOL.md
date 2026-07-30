@@ -253,6 +253,65 @@ the protocol. Vendor presets, selected by catalogue code:
 | index / transparent black-mark | 1800 | 1300 |
 | black-mark cardstock          | 2500 | 2000 |
 
+### The consumable tags themselves
+
+Read off two rolls with an NFC phone app, decoded here. Relevant because it
+explains *why* 0x5D exists as the only route for third-party stock.
+
+| | Supvan (genuine) | Niimbot (third-party) |
+|---|---|---|
+| UID | `1D 98 78 7F 02 10 80` | `1D FD 47 C7 18 10 80` |
+| RF / chip | ISO 14443-A, NTAG213-class, 7-byte UID | identical |
+| CC (page 3) | `E1 10 12 00` — NFC Forum T2, 144 bytes, RW | identical |
+| lock bytes (page 2) | `00 00` — nothing locked | `80 FF` — pages 7-15 locked |
+
+**Same tag hardware, and not genuine NXP.** Real NXP NTAG carries manufacturer
+byte `0x04`; both of these start `0x1D`. Same prefix and identical capability
+container on rolls from two unrelated brands points at one OEM tag supplier
+behind both.
+
+**Both are read-protected from page 4.** A full dump aborts with a read error on
+page 4, which is the signature of NTAG21x `AUTH0 = 0x04` with `PROT = 1`
+(protection covering reads, not just writes). Pages 0-3 read fine on any tag
+regardless — they sit below `AUTH0` — so being able to read them proves nothing
+about protection, and an earlier reading of this as "not auth" was wrong on
+exactly that point.
+
+So the printer's failure on a foreign roll is **password authentication**, not a
+protocol mismatch and not content validation: it derives a password from the UID,
+authenticates, and only its own tags match. It never reaches the point of reading
+content, which is why `RETURN_MAT` returns a zeroed record rather than garbage.
+
+**Password derivation** (`generalPassword` in `t5080imageEncodeUtils.js`): NTAG21x
+`PWD`/`PACK` from `SHA-256(UID ‖ Pwkey)`, taking digest bytes `[6][5][3][1]` as
+the 32-bit PWD and `[9][12]` as the 16-bit PACK. `Pwkey` is the 16-byte constant
+in `RFIDMatModel`. **The whole block is commented out** in the shipped editor,
+with its author's note `字节数组算法有问题` ("byte array algorithm has a
+problem") — so the host never computes it and the firmware must. Treat the
+formula as plausible but unconfirmed.
+
+For the two UIDs above it yields `PWD=D3F0F5E0 PACK=37A3` (Supvan) and
+`PWD=DC86DD5D PACK=8625` (Niimbot — arithmetic only; Niimbot uses its own key).
+
+**A Niimbot tag cannot be converted into a Supvan one.** The material record is
+80 bytes = pages 4-23, and pages 7-15 are locked. NTAG static lock bits are
+one-way. Hence `SET_RFID_DATA` injection is the only path, which is what
+`Printer::provision_material` does.
+
+**Unverified, and it matters.** `supvan-app`'s `record_is_ours` refuses to
+overwrite a roll whose 8-byte signature field (`MaterialInfo::code`) is non-zero,
+on the reasoning that genuine tags carry one and records we write never do.
+Confirming that needs a genuine tag's pages 4+, which needs the password above.
+Until then it is an assumption, and the one place a wrong guess could overwrite a
+real roll.
+
+**If you attempt authentication, mind `AUTHLIM`** (config page `0x2A`, low 3
+bits). It caps consecutive failed authentications and is one-way: exceed it and
+the tag refuses auth permanently, making user memory unreadable for good. Its
+value can't be checked first, since the config pages are themselves above
+`AUTH0`. A couple of deliberate attempts on a sacrificial roll is reasonable;
+brute-forcing is how you brick it.
+
 ### Energy control and its limits
 
 Two knobs, in series: the material record's heat times set absolute pulse width,
@@ -545,7 +604,8 @@ remaining-label counter (probably also somewhere in 30..50). The
 | `READ_FWVER` over USB | `parse_firmware_version_response` stub | No way to read firmware version over USB without bigger HID report. |
 | `MaterialInfo.remaining` over USB | parse_usb_material returns None | Label-counter UX broken for USB-only setups. |
 | BT `device_sn` BCD vs USB ASCII | `status::parse_material` | The two transports report the same physical value but in different encodings; downstream code can't naïvely string-compare. |
-| `SET_RFID_DATA` (0x5D) | not exercised by any code path | We've never sent it. Firmware support unknown. |
+| Genuine-tag signature | `supvan-app::record_is_ours` | We assume a real consumable carries a non-zero `MaterialInfo::code` and records we write never do. Unconfirmed — needs a genuine tag's pages 4+, which are password-protected. The one place a wrong guess could overwrite a real roll. |
+| Consumable tag password | `generalPassword`, commented out upstream | The `SHA-256(UID ‖ Pwkey)` derivation is plausible but never exercised by the vendor's own host code, so unverified. Blocks reading a genuine tag's record. |
 | `BUF_FULL` (0x10) handling | request side is implemented; what the device sends back when its buffer fills mid-print isn't fully decoded. | KsJob's per-packet ack loop handles the timing but doesn't surface a typed status. |
 
 ## Appendix: BLE GATT transport (implemented behind the `ble` feature, unverified)
