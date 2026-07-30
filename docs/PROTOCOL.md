@@ -641,6 +641,9 @@ over GATT notifications as over the RFCOMM stream.
 
 ## See also
 
+- `docs/HARDWARE.md` — board survey: the Bluetooth SoC, motor driver and the
+  5-pad debug port, plus why firmware is the only route to the two unverified
+  items above.
 - `crates/supvan-proto/src/cmd.rs` — command constants + frame builders.
 - `crates/supvan-proto/src/status.rs` — BT response parsers + bit
   assignments.
