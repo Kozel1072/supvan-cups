@@ -23,3 +23,6 @@ memory/
 /pappl*.tar.gz
 /pappl*.tar.xz
 /pappl*.dsc
+
+# Local dev override pointing at a sibling ipp-printer-app checkout
+/.cargo/
