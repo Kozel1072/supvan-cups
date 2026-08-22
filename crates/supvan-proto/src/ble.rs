@@ -6,14 +6,17 @@
 //! pipe differs: GATT notify/write characteristics instead of an RFCOMM stream.
 //!
 //! The wire details follow the vendor Android app (`BLEUtils.java`):
-//! - Connect (TRANSPORT_LE), let BlueZ negotiate the ATT MTU (the app requests
-//!   200), discover services, enable notifications.
+//! - Connect (TRANSPORT_LE, no bonding — the app never calls `createBond`),
+//!   let BlueZ negotiate the ATT MTU (the app requests 200), discover
+//!   services, enable notifications.
 //! - One of three service/characteristic patterns is auto-detected (see
 //!   [`chars_for_service`]); first match wins.
-//! - Commands/status use write-with-response; bulk image data uses
-//!   write-without-response.
-//! - A response notification echoes the request's command byte at offset 7;
-//!   poll up to ~4 s for the match (the app loops 200 × 20 ms).
+//! - Every frame goes out as an ATT **write request** (`BLEUtils.write`), in
+//!   128-byte fragments: `BasePrint.transferSplitData` splits each 512-byte
+//!   data frame into 4 × 128 with ~10 ms between them.
+//! - A command notification echoes the request's command byte at offset 7;
+//!   poll up to ~4 s for the match (the app loops 200 × 20 ms). Data frames
+//!   are **not** acked over BLE — see [`SppPipe::acks_data_frames`].
 //!
 //! This transport is **unverified against hardware** — we own no BLE printer.
 //! It is gated behind the `ble` feature; the pure framing helpers below are
@@ -70,7 +73,7 @@ mod imp {
     use crate::spp_pipe::SppPipe;
     use bluer::gatt::WriteOp;
     use bluer::gatt::remote::{Characteristic, CharacteristicWriteRequest};
-    use bluer::{Address, Device, Session};
+    use bluer::{Adapter, Address, Device, DiscoveryFilter, DiscoveryTransport, Session};
     use futures_util::StreamExt;
     use std::pin::Pin;
     use std::time::Duration;
@@ -78,9 +81,19 @@ mod imp {
 
     /// Response poll budget — matches the vendor app's 200 × 20 ms ≈ 4 s.
     const RESPONSE_TIMEOUT: Duration = Duration::from_secs(4);
-    /// Fragment size for write-without-response bulk data. Conservative for a
-    /// negotiated ATT MTU of ~200 (max payload is MTU − 3).
-    const BLE_WRITE_CHUNK: usize = 180;
+    /// GATT write fragment size: the vendor splits every 512-byte data frame
+    /// into 4 × 128 bytes, so 128 is what the firmware is fed.
+    const BLE_CHUNK: usize = 128;
+    /// Pacing between fragments, as passed by the T50/G15 print flows.
+    const BLE_CHUNK_DELAY: Duration = Duration::from_millis(10);
+    /// BlueZ can leave `Connect()` pending for minutes (bluer's own D-Bus
+    /// budget is 120 s). Give up sooner and retry — an LE connect that is
+    /// going to work generally works within a few seconds.
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+    const CONNECT_ATTEMPTS: usize = 3;
+    /// How long to scan for a printer BlueZ has never seen (or has aged out of
+    /// its cache) before giving up on the address.
+    const DISCOVERY_WINDOW: Duration = Duration::from_secs(8);
 
     type NotifyStream = Pin<Box<dyn futures_util::Stream<Item = Vec<u8>> + Send>>;
 
@@ -108,9 +121,23 @@ mod imp {
             let addr: Address = address
                 .parse()
                 .map_err(|_| Error::InvalidParam(format!("invalid BLE address: {address}")))?;
+
+            // BlueZ can only connect to a device it currently knows about, and
+            // it drops unpaired ones from its cache once they stop advertising.
+            // Scan first if it has forgotten this one — and finish scanning
+            // before connecting, because an open discovery session is the
+            // classic reason `Connect()` never returns.
+            let known = adapter.device_addresses().await.map_err(map_err)?;
+            if !known.contains(&addr) {
+                scan_for(&adapter, addr).await?;
+            }
+
             let device = adapter.device(addr).map_err(map_err)?;
-            if !device.is_connected().await.map_err(map_err)? {
-                device.connect().await.map_err(map_err)?;
+            connect_with_retry(&device).await?;
+            // Trusted lets BlueZ re-establish the link later without an agent,
+            // matching what the classic path does after pairing.
+            if let Err(e) = device.set_trusted(true).await {
+                log::debug!("BLE: could not set Trusted on {address}: {e}");
             }
 
             let (notify_char, write_char) = find_chars(&device).await?;
@@ -123,45 +150,100 @@ mod imp {
             })
         }
 
-        /// Write `data` in MTU-sized chunks. `with_response` selects the ATT
-        /// write type (commands: with response; bulk data: without).
-        async fn write_chunked(&self, data: &[u8], with_response: bool) -> Result<()> {
-            for chunk in data.chunks(BLE_WRITE_CHUNK) {
-                if with_response {
-                    self.write_char.write(chunk).await.map_err(map_err)?;
-                } else {
-                    let req = CharacteristicWriteRequest {
-                        op_type: WriteOp::Command,
-                        ..Default::default()
-                    };
-                    self.write_char
-                        .write_ext(chunk, &req)
-                        .await
-                        .map_err(map_err)?;
+        /// Write `data` as paced [`BLE_CHUNK`]-sized ATT write requests.
+        ///
+        /// `bluer`'s `Characteristic::write` defaults to `WriteOp::Command`
+        /// (write *without* response), so the op type has to be spelled out —
+        /// the vendor app writes every frame with response.
+        async fn write_chunked(&self, data: &[u8]) -> Result<()> {
+            let req = CharacteristicWriteRequest {
+                op_type: WriteOp::Request,
+                ..Default::default()
+            };
+            for (i, chunk) in data.chunks(BLE_CHUNK).enumerate() {
+                if i > 0 {
+                    tokio::time::sleep(BLE_CHUNK_DELAY).await;
                 }
+                self.write_char
+                    .write_ext(chunk, &req)
+                    .await
+                    .map_err(map_err)?;
             }
             Ok(())
         }
 
-        /// Wait up to [`RESPONSE_TIMEOUT`] for a notification. When `want` is
-        /// `Some(cmd)`, only a notification echoing `cmd` at offset 7 counts
-        /// (command/status replies); `None` accepts the next notification (a
-        /// bulk-data ack, which is not a command echo).
-        async fn await_response(&self, want: Option<u8>) -> Result<Option<Vec<u8>>> {
+        /// Wait up to [`RESPONSE_TIMEOUT`] for a notification echoing `cmd` at
+        /// offset 7, discarding anything else that arrives meanwhile.
+        async fn await_response(&self, cmd: u8) -> Result<Option<Vec<u8>>> {
             let mut stream = self.notify.lock().await;
-            let collect = async {
+            let matching = async {
                 while let Some(payload) = stream.next().await {
-                    match want {
-                        Some(cmd) if !response_matches(&payload, cmd) => continue,
-                        _ => return Some(payload),
+                    if response_matches(&payload, cmd) {
+                        return Some(payload);
                     }
                 }
                 None
             };
-            Ok(tokio::time::timeout(RESPONSE_TIMEOUT, collect)
+            Ok(tokio::time::timeout(RESPONSE_TIMEOUT, matching)
                 .await
                 .unwrap_or(None))
         }
+    }
+
+    /// Run an LE scan until `addr` shows up, then stop it.
+    async fn scan_for(adapter: &Adapter, addr: Address) -> Result<()> {
+        log::info!("BLE: {addr} not known to BlueZ, scanning");
+        adapter
+            .set_discovery_filter(DiscoveryFilter {
+                transport: DiscoveryTransport::Le,
+                ..Default::default()
+            })
+            .await
+            .map_err(map_err)?;
+        let mut events = adapter.discover_devices().await.map_err(map_err)?;
+        let found = async {
+            while let Some(ev) = events.next().await {
+                if matches!(ev, bluer::AdapterEvent::DeviceAdded(a) if a == addr) {
+                    return true;
+                }
+            }
+            false
+        };
+        let found = tokio::time::timeout(DISCOVERY_WINDOW, found)
+            .await
+            .unwrap_or(false);
+        // Dropping the stream ends the discovery session; do it before the
+        // caller connects.
+        drop(events);
+        if !found {
+            return Err(Error::Ble(format!("{addr} did not advertise")));
+        }
+        Ok(())
+    }
+
+    /// Connect, bounding each attempt well inside bluer's 120 s D-Bus budget.
+    async fn connect_with_retry(device: &Device) -> Result<()> {
+        let mut last = None;
+        for attempt in 1..=CONNECT_ATTEMPTS {
+            if device.is_connected().await.map_err(map_err)? {
+                return Ok(());
+            }
+            match tokio::time::timeout(CONNECT_TIMEOUT, device.connect()).await {
+                Ok(Ok(())) => return Ok(()),
+                Ok(Err(e)) => {
+                    log::warn!("BLE: connect attempt {attempt} failed: {e}");
+                    last = Some(e.to_string());
+                }
+                Err(_) => {
+                    log::warn!("BLE: connect attempt {attempt} timed out");
+                    last = Some(format!("no reply from BlueZ within {CONNECT_TIMEOUT:?}"));
+                    // A stuck Connect stays pending inside BlueZ; Disconnect is
+                    // the documented way to cancel it before trying again.
+                    let _ = device.disconnect().await;
+                }
+            }
+        }
+        Err(Error::Ble(last.unwrap_or_else(|| "connect failed".into())))
     }
 
     async fn find_chars(device: &Device) -> Result<(Characteristic, Characteristic)> {
@@ -191,24 +273,23 @@ mod imp {
     #[async_trait::async_trait]
     impl SppPipe for BlePipe {
         async fn send_cmd_frame(&self, frame: &[u8; 16]) -> Result<Option<Vec<u8>>> {
-            // Commands use write-with-response; the reply echoes frame[7].
-            self.write_chunked(frame, true).await?;
-            self.await_response(Some(frame[7])).await
+            self.write_chunked(frame).await?;
+            self.await_response(frame[7]).await
         }
 
+        /// The flag is moot here: [`Self::acks_data_frames`] is false, so the
+        /// codec never asks for a reply that BLE would not send.
         async fn send_data_frame(
             &self,
             frame: &[u8; 512],
-            read_response: bool,
+            _read_response: bool,
         ) -> Result<Option<Vec<u8>>> {
-            // Bulk image data uses write-without-response, fragmented to MTU.
-            self.write_chunked(frame, false).await?;
-            if read_response {
-                // A per-packet ack is not a command echo — take the next notify.
-                self.await_response(None).await
-            } else {
-                Ok(None)
-            }
+            self.write_chunked(frame).await?;
+            Ok(None)
+        }
+
+        fn acks_data_frames(&self) -> bool {
+            false
         }
     }
 }

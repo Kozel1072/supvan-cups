@@ -33,6 +33,14 @@ pub trait SppPipe: Send + Sync {
         frame: &[u8; 512],
         read_response: bool,
     ) -> Result<Option<Vec<u8>>>;
+
+    /// Whether the link acks every data frame. Classic SPP does; BLE does not
+    /// — `BasePrint.transferSplitData` only reads a reply in its
+    /// `CLASSIC_BLUETOOTH` branch, so a BLE pipe that waited would stall for
+    /// the response timeout on every frame.
+    fn acks_data_frames(&self) -> bool {
+        true
+    }
 }
 
 /// Drives an [`SppPipe`] to implement the SPP-framed [`Transport`] protocol
@@ -77,11 +85,13 @@ impl<P: SppPipe> Transport for SppCodec<P> {
         // reads a response after EVERY data packet, not only the last. The
         // firmware acks each packet and expects us to drain that ack before the
         // next — otherwise leftover RX bytes confuse the next BUF_FULL read.
+        // Links that don't ack at all (BLE) opt out via `acks_data_frames`.
+        let acked = self.pipe.acks_data_frames();
         let frames = build_data_frames(data);
         let mut last_resp = None;
         for (i, frame) in frames.iter().enumerate() {
             let is_last = i == frames.len() - 1;
-            let want_resp = if is_last { read_final_response } else { true };
+            let want_resp = acked && (!is_last || read_final_response);
             let resp = self.pipe.send_data_frame(frame, want_resp).await?;
             if is_last {
                 last_resp = resp;
@@ -112,5 +122,65 @@ impl<P: SppPipe> Transport for SppCodec<P> {
 
     fn parse_version_response(&self, resp: &[u8]) -> Option<String> {
         status::parse_version(resp)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Records the `read_response` flag the codec asked for on each frame.
+    struct RecordingPipe {
+        acks: bool,
+        asked: Mutex<Vec<bool>>,
+    }
+
+    #[async_trait]
+    impl SppPipe for RecordingPipe {
+        async fn send_cmd_frame(&self, _frame: &[u8; 16]) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+
+        async fn send_data_frame(
+            &self,
+            _frame: &[u8; 512],
+            read_response: bool,
+        ) -> Result<Option<Vec<u8>>> {
+            self.asked.lock().unwrap().push(read_response);
+            Ok(None)
+        }
+
+        fn acks_data_frames(&self) -> bool {
+            self.acks
+        }
+    }
+
+    async fn asked_for(acks: bool, read_final_response: bool) -> Vec<bool> {
+        let codec = SppCodec::new(RecordingPipe {
+            acks,
+            asked: Mutex::new(Vec::new()),
+        });
+        // Three frames' worth of payload.
+        let payload = vec![0u8; crate::data::DATA_PAYLOAD_SIZE * 2 + 1];
+        codec
+            .send_bulk_data(&payload, read_final_response)
+            .await
+            .unwrap();
+        codec.pipe.asked.lock().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn acking_links_drain_every_frame_but_honour_the_final_flag() {
+        assert_eq!(asked_for(true, false).await, vec![true, true, false]);
+        assert_eq!(asked_for(true, true).await, vec![true, true, true]);
+    }
+
+    #[tokio::test]
+    async fn non_acking_links_never_wait() {
+        // BLE: waiting on a frame the firmware never acks costs one response
+        // timeout per frame.
+        assert_eq!(asked_for(false, false).await, vec![false, false, false]);
+        assert_eq!(asked_for(false, true).await, vec![false, false, false]);
     }
 }

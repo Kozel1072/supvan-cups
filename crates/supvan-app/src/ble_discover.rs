@@ -61,7 +61,7 @@ pub async fn list_candidates() -> Vec<BleCandidate> {
 async fn scan() -> bluer::Result<Vec<BleCandidate>> {
     use bluer::{DiscoveryFilter, DiscoveryTransport};
     use futures_util::StreamExt;
-    use std::collections::HashSet;
+    use std::collections::BTreeSet;
     use std::time::Duration;
     use supvan_proto::ble::chars_for_service;
 
@@ -80,47 +80,52 @@ async fn scan() -> bluer::Result<Vec<BleCandidate>> {
         })
         .await?;
 
+    // Collect addresses only. BlueZ fills Name and UUIDs in over several
+    // PropertiesChanged signals after the device first appears, so a device
+    // seen for the first time has neither at DeviceAdded time; reading them
+    // here would silently drop it.
     let mut events = adapter.discover_devices().await?;
-    let mut out = Vec::new();
-    let mut seen = HashSet::new();
-
+    let mut seen = BTreeSet::new();
     let collect = async {
         while let Some(ev) = events.next().await {
-            let bluer::AdapterEvent::DeviceAdded(addr) = ev else {
-                continue;
-            };
-            let astr = addr.to_string();
-            if !is_supvan_oui(&astr) {
-                continue;
-            }
-            let Ok(dev) = adapter.device(addr) else {
-                continue;
-            };
-            let name = dev.name().await.ok().flatten().unwrap_or_default();
-            // Definitive discriminator: the device must advertise a Supvan GATT
-            // service (fee7/e0ff/ff00). Classic printers expose only SPP (Serial
-            // Port 1101) and are excluded here even if BlueZ echoes them.
-            let advertises_gatt = dev
-                .uuids()
-                .await
-                .ok()
-                .flatten()
-                .unwrap_or_default()
-                .iter()
-                .any(|u| chars_for_service(*u).is_some());
-            if advertises_gatt && is_supvan_ble(&astr, &name) && seen.insert(astr.clone()) {
-                log::info!("ble_discover: found {name} ({astr})");
-                out.push(BleCandidate {
-                    address: astr,
-                    name,
-                });
+            if let bluer::AdapterEvent::DeviceAdded(addr) = ev {
+                seen.insert(addr);
             }
         }
-        Ok::<(), bluer::Error>(())
     };
-
-    // The scan runs until the window elapses; a timeout is the normal exit.
     let _ = tokio::time::timeout(SCAN_WINDOW, collect).await;
+    // Ends the discovery session: BlueZ stalls Connect() while a scan runs.
+    drop(events);
+
+    let mut out = Vec::new();
+    for addr in seen {
+        let astr = addr.to_string();
+        if !is_supvan_oui(&astr) {
+            continue;
+        }
+        let Ok(dev) = adapter.device(addr) else {
+            continue;
+        };
+        let name = dev.name().await.ok().flatten().unwrap_or_default();
+        // Definitive discriminator: the device must advertise a Supvan GATT
+        // service (fee7/e0ff/ff00). Classic printers expose only SPP (Serial
+        // Port 1101) and are excluded here even if BlueZ echoes them.
+        let advertises_gatt = dev
+            .uuids()
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+            .iter()
+            .any(|u| chars_for_service(*u).is_some());
+        if advertises_gatt && is_supvan_ble(&astr, &name) {
+            log::info!("ble_discover: found {name} ({astr})");
+            out.push(BleCandidate {
+                address: astr,
+                name,
+            });
+        }
+    }
     Ok(out)
 }
 

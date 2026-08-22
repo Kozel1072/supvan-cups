@@ -16,6 +16,9 @@ uuid = "1"
 bluer = { version = "0.17", optional = true, features = ["bluetoothd"] }
 futures-util = { version = "0.3", optional = true }
 
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+
 [features]
 default = []
 ble = ["dep:bluer", "dep:futures-util"]
