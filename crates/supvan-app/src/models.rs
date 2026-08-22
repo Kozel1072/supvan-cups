@@ -50,21 +50,35 @@ struct ModelToml {
 }
 
 #[derive(Deserialize)]
+struct BtNameToml {
+    model: String,
+    family: String,
+    prefixes: Vec<String>,
+}
+
+#[derive(Deserialize)]
 struct ModelsToml {
     families: Vec<FamilyToml>,
     models: Vec<ModelToml>,
-    bt_patterns: HashMap<String, Vec<String>>,
+    bt_names: Vec<BtNameToml>,
 }
 
 // ---------------------------------------------------------------------------
 // Registry singleton
 // ---------------------------------------------------------------------------
 
+/// One advertised-name prefix and the printer it identifies.
+struct BtPrefix {
+    prefix: String,
+    model: String,
+    family_idx: usize,
+}
+
 struct Registry {
     families: Vec<DriverFamily>,
     models: Vec<UsbModel>,
-    /// (pattern, family_idx) — longest patterns first for correct matching.
-    bt_patterns: Vec<(String, usize)>,
+    /// Longest prefix first, so `t0021b` wins over `t0021`.
+    bt_prefixes: Vec<BtPrefix>,
     default_family_idx: usize,
 }
 
@@ -98,8 +112,12 @@ pub fn load() {
         }
         None => (EMBEDDED_MODELS.to_string(), "<embedded>".to_string()),
     };
+    load_from_str(&contents, &source);
+}
+
+fn load_from_str(contents: &str, source: &str) {
     let toml: ModelsToml =
-        toml::from_str(&contents).unwrap_or_else(|e| panic!("failed to parse {source}: {e}"));
+        toml::from_str(contents).unwrap_or_else(|e| panic!("failed to parse {source}: {e}"));
 
     let families: Vec<DriverFamily> = toml
         .families
@@ -155,23 +173,29 @@ pub fn load() {
         })
         .collect();
 
-    // Flatten bt_patterns: (pattern, family_idx), sorted longest-first
-    let mut bt_patterns: Vec<(String, usize)> = Vec::new();
-    for (family_name, patterns) in &toml.bt_patterns {
-        let idx = *family_index
-            .get(family_name.as_str())
-            .unwrap_or_else(|| panic!("bt_patterns references unknown family '{family_name}'"));
-        for pattern in patterns {
-            bt_patterns.push((pattern.clone(), idx));
+    let mut bt_prefixes: Vec<BtPrefix> = Vec::new();
+    for entry in &toml.bt_names {
+        let family_idx = *family_index.get(entry.family.as_str()).unwrap_or_else(|| {
+            panic!(
+                "bt_names entry '{}' references unknown family '{}'",
+                entry.model, entry.family
+            )
+        });
+        for prefix in &entry.prefixes {
+            bt_prefixes.push(BtPrefix {
+                prefix: prefix.to_lowercase(),
+                model: entry.model.clone(),
+                family_idx,
+            });
         }
     }
-    bt_patterns.sort_by_key(|p| std::cmp::Reverse(p.0.len()));
+    bt_prefixes.sort_by_key(|p| std::cmp::Reverse(p.prefix.len()));
 
     if REGISTRY
         .set(Registry {
             families,
             models,
-            bt_patterns,
+            bt_prefixes,
             default_family_idx,
         })
         .is_err()
@@ -221,24 +245,33 @@ pub fn model_by_pid(pid: &str) -> Option<&'static UsbModel> {
         .find(|m| m.pid.eq_ignore_ascii_case(pid))
 }
 
-/// Determine the driver family from a model name or BT broadcast name.
-///
-/// Uses substring matching against bt_patterns (longest first).
-/// Falls back to the default family for unknown names.
-pub fn family_for_model_hint(name: &str) -> &'static DriverFamily {
+/// Longest matching advertised-name prefix, if any.
+fn match_bt_prefix(name: &str) -> Option<&'static BtPrefix> {
     let lower = name.to_lowercase();
-    let reg = registry();
-
-    for (pattern, idx) in &reg.bt_patterns {
-        if lower.contains(pattern.as_str()) {
-            return &reg.families[*idx];
-        }
-    }
-
-    &reg.families[reg.default_family_idx]
+    registry()
+        .bt_prefixes
+        .iter()
+        .find(|p| lower.starts_with(p.prefix.as_str()))
 }
 
-/// Check if a Bluetooth device name matches any known Supvan printer pattern.
+/// Determine the driver family from a model name or BT/BLE advertised name.
+///
+/// Falls back to the default family for unknown names.
+pub fn family_for_model_hint(name: &str) -> &'static DriverFamily {
+    let reg = registry();
+    match match_bt_prefix(name) {
+        Some(p) => &reg.families[p.family_idx],
+        None => &reg.families[reg.default_family_idx],
+    }
+}
+
+/// The marketing model name behind an advertised name (`T0182A2507162197` →
+/// `E11`), or `None` if the prefix is unknown.
+pub fn bt_model_for_name(name: &str) -> Option<&'static str> {
+    match_bt_prefix(name).map(|p| p.model.as_str())
+}
+
+/// Check if a Bluetooth device name matches any known Supvan printer.
 pub fn is_matching_bt_name(name: &str) -> bool {
     let lower = name.to_lowercase();
 
@@ -246,10 +279,7 @@ pub fn is_matching_bt_name(name: &str) -> bool {
         return true;
     }
 
-    registry()
-        .bt_patterns
-        .iter()
-        .any(|(pattern, _)| lower.contains(pattern.as_str()))
+    match_bt_prefix(&lower).is_some()
 }
 
 /// Parse the MDL field from an IEEE 1284 device ID string.
@@ -259,4 +289,64 @@ pub fn parse_mdl(device_id: &str) -> Option<&str> {
     device_id
         .split(';')
         .find_map(|field| field.strip_prefix("MDL:"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The registry is a process-wide singleton; `load()` panics if called
+    /// twice, so every test funnels through here.
+    fn init() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        // Always the embedded table, never a stale system install.
+        ONCE.call_once(|| load_from_str(EMBEDDED_MODELS, "<embedded>"));
+    }
+
+    #[test]
+    fn advertised_serial_names_resolve_to_models() {
+        init();
+        // The two names from supvan-cups#1 — an E11 and an E10, as BlueZ
+        // reports them.
+        assert_eq!(bt_model_for_name("T0182A2507162197"), Some("E11"));
+        assert_eq!(bt_model_for_name("T0131F251217E291"), Some("E10/T10"));
+        assert_eq!(bt_model_for_name("T0117A2401010001"), Some("T50M Pro"));
+    }
+
+    #[test]
+    fn discovery_accepts_advertised_serial_names() {
+        init();
+        assert!(is_matching_bt_name("T0182A2507162197"));
+        assert!(is_matching_bt_name("T0131F251217E291"));
+        // Brand words are accepted anywhere, not just as a prefix.
+        assert!(is_matching_bt_name("My Supvan Printer"));
+        assert!(!is_matching_bt_name("Some Headphones"));
+    }
+
+    #[test]
+    fn a_trailing_letter_selects_a_different_model() {
+        init();
+        // t0021a and t0021b are distinct printers; longest-prefix-first
+        // ordering must not let a shorter pattern swallow either.
+        assert_eq!(bt_model_for_name("T0021A0000"), Some("T50M"));
+        assert_eq!(bt_model_for_name("T0021B0000"), Some("T50M Plus"));
+    }
+
+    #[test]
+    fn serials_are_matched_as_prefixes_not_substrings() {
+        init();
+        // A T50 Max serial embeds "0007", which is an E10 prefix once the
+        // leading T is glued on. Substring matching used to call this an E10.
+        assert_eq!(bt_model_for_name("T0192T00071234"), Some("T50 Max"));
+    }
+
+    #[test]
+    fn mdl_strings_still_resolve_a_family() {
+        init();
+        // driver_for_device feeds the IEEE 1284 MDL through the same table.
+        let f = family_for_model_hint("T80M Pro");
+        assert_eq!(f.driver_name.to_str().unwrap(), "supvan_t80");
+        let f = family_for_model_hint("E11");
+        assert_eq!(f.driver_name.to_str().unwrap(), "supvan_t50");
+    }
 }

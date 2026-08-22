@@ -196,17 +196,199 @@ pid = "203e"
 name = "SP650"
 family = "supvan_sp650"
 
-# -- Bluetooth name patterns (substring match, case-insensitive) -------------
+# -- Bluetooth advertised-name prefixes --------------------------------------
 #
-# Used for BT discovery (is_matching_bt_name) and family detection
-# (family_for_model_hint). The brand names "supvan" and "katasymbol" are
-# always accepted for discovery but don't select a specific family.
+# Printers advertise a firmware serial name, not a marketing name — an E11
+# shows up as `T0182A2507162197`, a T50M Pro as `T0117A...`. The vendor app
+# resolves these with a startsWith() over per-model prefix tables
+# (DeviceConstants.java + the communication/device/*Device.java classes);
+# these entries are transcribed from there, with the marketing names kept as
+# prefixes too so an IEEE 1284 MDL string ("T50M Pro") resolves the same way.
+#
+# Matching is case-insensitive and longest-prefix-first. The brand words
+# "supvan" and "katasymbol" are additionally accepted anywhere in a name for
+# discovery, but don't select a family.
+#
+# Caveat: E10/E11/E12/E16/T10/T16 are grouped under supvan_t50 for media and
+# DPI, but the vendor drives them with different print flows (E11/E12 use the
+# G15 flow over BLE). Discovery and naming are right; printing is unverified.
 
-[bt_patterns]
-supvan_t50 = ["t50", "t0117", "e10", "e11", "e12", "e16"]
-supvan_t80 = ["t80"]
-supvan_g = ["g11", "g15", "g18"]
-supvan_tp76 = ["tp76"]
-supvan_tp80 = ["tp80"]
-supvan_tp86 = ["tp86"]
-supvan_sp650 = ["sp650"]
+[[bt_names]]
+model = "T50A"
+family = "supvan_t50"
+prefixes = ["t50a", "t0013a", "t0020a", "t0121a"]
+
+[[bt_names]]
+model = "T50M"
+family = "supvan_t50"
+prefixes = ["t50m", "t0021a", "t0022a", "t0104a"]
+
+[[bt_names]]
+model = "T50M Plus"
+family = "supvan_t50"
+prefixes = ["t0021b", "t0102b", "t0103b", "t0116b"]
+
+[[bt_names]]
+model = "T50M Pro"
+family = "supvan_t50"
+prefixes = [
+    "t0096a", "t0117a", "t0118a", "t0129a", "t0147b", "t0148b", "t0162b",
+    "t0163b", "t0170b", "t0178b", "t0205", "t0211b", "t0212b", "t0213b"
+]
+
+[[bt_names]]
+model = "T50 Plus"
+family = "supvan_t50"
+prefixes = ["t0013b", "t0020b"]
+
+[[bt_names]]
+model = "T50 Pro"
+family = "supvan_t50"
+prefixes = [
+    "t0046a", "t0100a", "t0112a", "t0113a", "t0145b", "t0149b", "t0150b",
+    "t0151b", "t0152b", "t0159b", "t0160b", "t0200", "t0201", "t0202"
+]
+
+[[bt_names]]
+model = "T50 Max"
+family = "supvan_t50"
+prefixes = ["t0192", "t0204"]
+
+[[bt_names]]
+model = "T50S"
+family = "supvan_t50"
+prefixes = ["t50s", "t0099a"]
+
+[[bt_names]]
+model = "E10/T10"
+family = "supvan_t50"
+prefixes = [
+    "e10", "t10", "t0007", "t0010", "t0011", "t0012", "t0017", "t0025",
+    "t0026", "t0027", "t0028", "t0034", "t0035", "t0036", "t0037",
+    "t0038", "t0039", "t0040", "t0041", "t0042", "t0043", "t0044",
+    "t0045", "t0057", "t0058", "t0059", "t0060", "t0061", "t0064",
+    "t0065", "t0066", "t0067", "t0068", "t0071", "t0072", "t0073",
+    "t0075", "t0077", "t0078", "t0081", "t0082", "t0083", "t0084",
+    "t0085", "t0086", "t0087", "t0088", "t0089", "t0090", "t0091",
+    "t0092", "t0093", "t0094", "t0095", "t0098", "t0124", "t0125",
+    "t0126", "t0127", "t0130", "t0131", "t0132", "t0133", "t0134",
+    "t0135", "t0136", "t0137", "t0143", "t0144", "t0176", "t0177",
+    "t0179", "t0180", "t0207", "t0208", "t0209", "t0210", "t0001",
+    "t0002", "t0003", "t0004", "t0005", "t0006", "t0008", "t0009",
+    "t0017", "t0032", "t0070", "t0071", "t0072", "t0073", "t0074",
+    "t0075", "t0076", "t0077", "t0124", "t0125", "t0126", "t0127", "t0140"
+]
+
+[[bt_names]]
+model = "E11"
+family = "supvan_t50"
+prefixes = [
+    "e11", "t0138", "t0139", "t0181", "t0182", "t0183", "t0184", "t0216",
+    "t0217", "t0218", "t0219"
+]
+
+[[bt_names]]
+model = "E12"
+family = "supvan_t50"
+prefixes = [
+    "e12", "t0187", "t0188", "t0189", "t0190", "t0194", "t0195", "t0196",
+    "t0197"
+]
+
+[[bt_names]]
+model = "E16/T16"
+family = "supvan_t50"
+prefixes = [
+    "e16", "t16", "t0053", "t0054", "t0055", "t0105", "t0106", "t0107",
+    "t0122", "t0123", "t0047", "t0052"
+]
+
+[[bt_names]]
+model = "T80S"
+family = "supvan_t80"
+prefixes = ["t80s", "t0033a", "t0175a"]
+
+[[bt_names]]
+model = "T80M"
+family = "supvan_t80"
+prefixes = ["t80m", "t0111a"]
+
+[[bt_names]]
+model = "T80M Pro"
+family = "supvan_t80"
+prefixes = ["t0173", "t0174"]
+
+[[bt_names]]
+model = "T80 Pro"
+family = "supvan_t80"
+prefixes = ["t0171", "t0186"]
+
+[[bt_names]]
+model = "T80 Max"
+family = "supvan_t80"
+prefixes = ["t0193"]
+
+[[bt_names]]
+model = "G11"
+family = "supvan_g"
+prefixes = ["g11", "g0022a"]
+
+[[bt_names]]
+model = "G11M"
+family = "supvan_g"
+prefixes = ["g11m", "g0023a", "g0025a"]
+
+[[bt_names]]
+model = "G11 Pro"
+family = "supvan_g"
+prefixes = ["g0028a", "g0028b", "g0049"]
+
+[[bt_names]]
+model = "G15"
+family = "supvan_g"
+prefixes = ["g15", "g0013a", "g0014", "g0003a"]
+
+[[bt_names]]
+model = "G15M"
+family = "supvan_g"
+prefixes = ["g15m", "g0004", "g0017a", "g0061", "g0070"]
+
+[[bt_names]]
+model = "G15M Pro"
+family = "supvan_g"
+prefixes = ["g0018a", "g0018b", "g0046a", "g0047a", "g0048a", "g0062"]
+
+[[bt_names]]
+model = "G15 Pro"
+family = "supvan_g"
+prefixes = ["g0015a", "g0015b", "g0016", "g0069"]
+
+[[bt_names]]
+model = "G18"
+family = "supvan_g"
+prefixes = ["g18", "g0041a"]
+
+[[bt_names]]
+model = "G18 Pro"
+family = "supvan_g"
+prefixes = ["g0042a", "g0042b", "g0044", "g0050"]
+
+[[bt_names]]
+model = "TP76I"
+family = "supvan_tp76"
+prefixes = ["tp76"]
+
+[[bt_names]]
+model = "TP80A"
+family = "supvan_tp80"
+prefixes = ["tp80"]
+
+[[bt_names]]
+model = "TP86A"
+family = "supvan_tp86"
+prefixes = ["tp86"]
+
+[[bt_names]]
+model = "SP650"
+family = "supvan_sp650"
+prefixes = ["sp650"]

@@ -135,11 +135,12 @@ impl DeviceBackend for SupvanDeviceBackend {
 
         let mut out = Vec::new();
         for (name, (usb, bt, ble)) in by_name {
+            // USB reports its model over the wire; BT and BLE only give us the
+            // advertised serial name, which the registry maps back to a model.
             let model = usb
                 .as_ref()
                 .map(|u| u.model_name.clone())
-                .or_else(|| bt.as_ref().map(|_| "T50 Series".to_string()))
-                .or_else(|| ble.as_ref().map(|_| "E-Series".to_string()))
+                .or_else(|| models::bt_model_for_name(&name).map(str::to_string))
                 .unwrap_or_else(|| "T50 Series".to_string());
             let info = format!("Supvan {model} {name}");
             let uri = format!("supvan://{}", slug(&name));
