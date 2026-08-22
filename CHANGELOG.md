@@ -7,6 +7,46 @@ minor version).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Bluetooth discovery could not match any real printer name.** Printers
+  advertise a firmware serial (`T0182A2507162197`), never a marketing name, so
+  the old `bt_patterns` entries (`"t50"`, `"e10"`, `"e11"`, …) matched nothing
+  and `discover.rs` dropped every device before pairing. `data/models.toml` now
+  carries the vendor's per-model serial-prefix tables — transcribed from
+  `DeviceConstants.java` and the `communication/device/*Device.java` classes —
+  under a new `[[bt_names]]` section, matched as case-insensitive
+  longest-prefix. Reported in supvan-cups#1 for an E10 and an E11.
+- Matching is now by prefix rather than substring; a serial that happens to
+  embed another model's code no longer resolves to the wrong family.
+- BT and BLE queues report their actual model (`E11`, `T50M Pro`) instead of the
+  placeholder `T50 Series` / `E-Series`, via the same table.
+- **Every BLE write went out without a response.** `bluer`'s
+  `Characteristic::write` defaults to `WriteOp::Command`, so the `with_response`
+  flag in `ble.rs` was a no-op. Frames are now explicit `WriteOp::Request`
+  writes, as the vendor app sends them.
+- **BLE fragmentation and pacing now match the firmware.** 128-byte fragments
+  with ~10 ms between them (`BasePrint.transferSplitData` splits each 512-byte
+  data frame into 4 × 128), replacing the guessed 180-byte MTU fragments.
+- **BLE data frames no longer wait for an ack that never comes.** The vendor
+  reads a per-frame reply only over Classic Bluetooth; the new
+  `SppPipe::acks_data_frames` lets the shared codec skip the wait on BLE, which
+  otherwise burned the 4 s response timeout on every frame.
+- **BLE connect no longer hangs for two minutes.** `BlePipe::connect` scans for
+  the address when BlueZ has forgotten it, finishes the scan before connecting
+  (an open discovery session is the usual reason `Connect()` never returns),
+  bounds each attempt at 20 s instead of bluer's 120 s D-Bus budget, retries,
+  and marks the device trusted.
+- BLE discovery no longer drops a printer BlueZ has just seen for the first
+  time: `Name` and `UUIDs` are read after the scan window, not at `DeviceAdded`,
+  when BlueZ has not yet filled them in.
+
+### Added
+
+- `supvan-cli` can talk to BLE printers: a `ble://<address>` target, behind the
+  crate's new `ble` feature. Previously every non-`/dev/hidraw` target was
+  dialled as Classic RFCOMM with no way to select GATT.
+
 ## [0.5.1] - 2026-07-01
 
 ### Added

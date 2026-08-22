@@ -629,15 +629,27 @@ BLE wire details (from the vendor `BLEUtils.java`, as implemented):
   `0000fee7-…` (notify == write `0000FEC1-…`), service
   `0000e0ff-3c17-d293-8e48-14fe2e4da212` (notify `0000ffe1-…`, write
   `0000ffe9-…`), or `0000ff00-…` (notify `0000ff01-…`, write `0000ff02-…`).
-- Commands/status: write-with-response, then wait for a notification echoing the
-  command byte at **offset 7**, polled up to ~4 s (the app loops 200 × 20 ms).
-- Bulk image data: write-without-response, fragmented to ~MTU.
-- Discovery (`crates/supvan-app/src/ble_discover.rs`): unfiltered LE scan, keep
-  advertisers matching name `^[TGD]\d{2}` and MAC OUI `A4:93:40`.
+- No bonding: the app calls `connectGatt(…, TRANSPORT_LE, PHY_LE_1M)` and never
+  `createBond()`. Pairing is not a prerequisite for GATT here.
+- Every frame is an ATT **write request** (`BLEUtils.write`), in **128-byte**
+  fragments with ~10 ms between them: `BasePrint.transferSplitData` splits each
+  512-byte data frame into 4 × 128. `writeNoResponse` exists but the T50/G15
+  print flows don't use it for frame transfer.
+- Commands/status: wait for a notification echoing the command byte at
+  **offset 7**, polled up to ~4 s (the app loops 200 × 20 ms).
+- Bulk image data is **not acked** over BLE — `transferSplitData` only reads a
+  reply in its `CLASSIC_BLUETOOTH` branch. `SppPipe::acks_data_frames` carries
+  this difference into the shared codec.
+- Discovery (`crates/supvan-app/src/ble_discover.rs`): LE-transport scan, keep
+  advertisers matching name `^[TGD]\d{2}`, MAC OUI `A4:93:40`, and one of the
+  three GATT services above. Properties are read after the scan window closes,
+  because BlueZ fills `Name`/`UUIDs` in only after `DeviceAdded`.
+- `supvan-cli` reaches BLE through a `ble://<address>` target, built with
+  `--features ble`.
 
-Known unknowns to confirm on real hardware: the 512-byte SPP frame fragmentation
-across BLE's smaller MTU, and whether the per-packet-ack drain behaves the same
-over GATT notifications as over the RFCOMM stream.
+Known unknowns to confirm on real hardware: whether an E11/E12 will drive
+correctly from the **T50 print flow** at all — the vendor runs `printingProcess
+== 4` through `G15Print`, not `T50PlusPrint`.
 
 ## See also
 
