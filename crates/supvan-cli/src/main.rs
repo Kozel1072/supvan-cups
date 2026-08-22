@@ -49,17 +49,17 @@ struct LabelArgs {
 enum Command {
     /// Probe printer: check device, status, material, version info
     Probe {
-        /// Bluetooth address or /dev/hidrawN path
+        /// Bluetooth address, `ble://<address>`, or /dev/hidrawN path
         target: String,
     },
     /// Query and print label material info
     Material {
-        /// Bluetooth address or /dev/hidrawN path
+        /// Bluetooth address, `ble://<address>`, or /dev/hidrawN path
         target: String,
     },
     /// Send a test print pattern
     TestPrint {
-        /// Bluetooth address or /dev/hidrawN path
+        /// Bluetooth address, `ble://<address>`, or /dev/hidrawN path
         target: String,
         /// Black print density (0-15)
         #[arg(short, long, default_value_t = 4)]
@@ -75,13 +75,13 @@ enum Command {
     },
     /// Feed/advance one blank label (PAPER_SKIP)
     Feed {
-        /// Bluetooth address or /dev/hidrawN path
+        /// Bluetooth address, `ble://<address>`, or /dev/hidrawN path
         target: String,
     },
     /// Write a synthetic label-material record, for stock whose RFID tag the
     /// printer can't read (third-party or foreign-brand rolls)
     Provision {
-        /// Bluetooth address or /dev/hidrawN path
+        /// Bluetooth address, `ble://<address>`, or /dev/hidrawN path
         target: String,
         #[command(flatten)]
         label: LabelArgs,
@@ -104,7 +104,7 @@ enum Command {
     /// profile. For two-colour thermal stock, this finds the energy at which the
     /// colour flips.
     HeatSweep {
-        /// Bluetooth address or /dev/hidrawN path
+        /// Bluetooth address, `ble://<address>`, or /dev/hidrawN path
         target: String,
         #[command(flatten)]
         label: LabelArgs,
@@ -122,7 +122,7 @@ enum Command {
     /// Tells us whether the firmware honours two-colour mode at all, and which
     /// plane is which.
     TwoColor {
-        /// Bluetooth address or /dev/hidrawN path
+        /// Bluetooth address, `ble://<address>`, or /dev/hidrawN path
         target: String,
         /// Label width across the printhead, mm
         #[arg(long, default_value_t = 40)]
@@ -142,7 +142,7 @@ enum Command {
     /// 1bpp, so every intermediate tone is the dither's doing — this is how you
     /// compare kernels on real stock.
     GrayRamp {
-        /// Bluetooth address or /dev/hidrawN path
+        /// Bluetooth address, `ble://<address>`, or /dev/hidrawN path
         target: String,
         /// Label width across the printhead, mm
         #[arg(long, default_value_t = 40)]
@@ -170,7 +170,7 @@ enum Command {
     /// Reads only. Nothing here writes, moves paper, or touches the firmware
     /// range — see `probe_raw` and the range warnings in `supvan_proto::cmd`.
     ProbeReads {
-        /// Bluetooth address or /dev/hidrawN path
+        /// Bluetooth address, `ble://<address>`, or /dev/hidrawN path
         target: String,
         /// Extra opcodes to try, hex or decimal (e.g. 0x2B,0xBD). Vetted against
         /// the write/motion/firmware deny-list before sending.
@@ -185,7 +185,7 @@ enum Command {
     /// unknown; the reply is compared against an unallocated opcode first, so a
     /// firmware that doesn't implement it is identified without anything moving.
     PaperBack {
-        /// Bluetooth address or /dev/hidrawN path
+        /// Bluetooth address, `ble://<address>`, or /dev/hidrawN path
         target: String,
         /// Parameter — meaning unknown, plausibly a distance. Starts at 0.
         #[arg(long, default_value_t = 0)]
@@ -195,19 +195,21 @@ enum Command {
     Discover,
 }
 
-fn connect(target: &str) -> Result<Printer, Box<dyn Error>> {
+async fn connect(target: &str) -> Result<Printer, Box<dyn Error>> {
     if target.starts_with("/dev/hidraw") {
         eprintln!("Opening USB HID {target}...");
+    } else if target.starts_with("ble:") {
+        eprintln!("Connecting to {target} (BLE GATT)...");
     } else {
         eprintln!("Connecting to {target} (Bluetooth)...");
     }
-    let printer = Printer::open_target(target)?;
+    let printer = Printer::open_target(target).await?;
     eprintln!("Connected.");
     Ok(printer)
 }
 
 async fn cmd_probe(target: &str) -> CliResult {
-    let printer = connect(target)?;
+    let printer = connect(target).await?;
 
     if printer.check_device().await? {
         eprintln!("Device: OK");
@@ -257,7 +259,7 @@ async fn cmd_probe(target: &str) -> CliResult {
 }
 
 async fn cmd_material(target: &str) -> CliResult {
-    let printer = connect(target)?;
+    let printer = connect(target).await?;
 
     if !printer.check_device().await? {
         return Err("device not responding".into());
@@ -287,7 +289,7 @@ async fn cmd_material(target: &str) -> CliResult {
 }
 
 async fn cmd_test_print(target: &str, density: Density, save_paper: bool) -> CliResult {
-    let printer = connect(target)?;
+    let printer = connect(target).await?;
 
     // Query material to get label dimensions, falling back to printhead-width
     // defaults if no label is installed.
@@ -325,7 +327,7 @@ async fn cmd_test_print(target: &str, density: Density, save_paper: bool) -> Cli
 }
 
 async fn cmd_feed(target: &str) -> CliResult {
-    let printer = connect(target)?;
+    let printer = connect(target).await?;
     printer.paper_skip().await?;
     eprintln!("Fed one label.");
     Ok(())
@@ -402,7 +404,7 @@ async fn cmd_provision(
     mat_type: u8,
     code: u16,
 ) -> CliResult {
-    let printer = connect(target)?;
+    let printer = connect(target).await?;
     let heat = heat.unwrap_or(heat_presets::STANDARD);
     let mat = build_material(label, heat, count, mat_type, code);
     provision(&printer, &mat).await
@@ -418,7 +420,7 @@ async fn cmd_gray_ramp(
     density: Density,
     vertical: bool,
 ) -> CliResult {
-    let printer = connect(target)?;
+    let printer = connect(target).await?;
     let (gray, w, h) = if vertical {
         create_gray_bands(width as u32, length as u32, steps)
     } else {
@@ -523,7 +525,7 @@ async fn cmd_probe_reads(target: &str, also: Vec<u8>) -> CliResult {
     /// Trailing bytes of every reply are device-constant; only the head varies.
     const COMPARE_LEN: usize = 16;
 
-    let printer = connect(target)?;
+    let printer = connect(target).await?;
 
     let control = printer
         .probe_raw(cmd::CMD_CHECK_DEVICE, 0)
@@ -598,7 +600,7 @@ async fn cmd_paper_back(target: &str, param: u16) -> CliResult {
     /// Middle of the largest unallocated hole — what "not implemented" looks like.
     const UNALLOCATED: u8 = 0x50;
 
-    let printer = connect(target)?;
+    let printer = connect(target).await?;
 
     let baseline = printer
         .probe_raw(UNALLOCATED, 0)
@@ -674,7 +676,7 @@ async fn cmd_two_color(
     density: Density,
     pattern: CardPattern,
 ) -> CliResult {
-    let printer = connect(target)?;
+    let printer = connect(target).await?;
     let (rgb, w, h) = create_two_colour_pattern(width as u32, length as u32, pattern);
 
     match pattern {
@@ -714,7 +716,7 @@ async fn cmd_heat_sweep(
         heats
     };
 
-    let printer = connect(target)?;
+    let printer = connect(target).await?;
     eprintln!(
         "Sweeping {} heat profiles x {} densities on {}mm x {}mm labels.",
         label.width,
@@ -752,8 +754,12 @@ fn cmd_discover() {
     eprintln!("Scanning for Supvan devices...");
     eprintln!("(For full D-Bus discovery, use the CUPS backend with 0 args)");
     eprintln!();
-    eprintln!("Manual discovery:");
-    eprintln!("  bluetoothctl devices | grep -i 'T0117\\|T50\\|Supvan\\|Katasymbol'");
+    eprintln!("Manual discovery — printers advertise a firmware serial name");
+    eprintln!("(T0117A..., T0182A...), not a model name, on OUI A4:93:40:");
+    eprintln!("  bluetoothctl devices | grep -i 'A4:93:40'");
+    eprintln!();
+    eprintln!("BLE-only models (E11/E12) take a ble:// target:");
+    eprintln!("  supvan-cli probe ble://A4:93:40:AA:BB:CC");
 }
 
 #[tokio::main(flavor = "multi_thread")]

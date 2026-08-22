@@ -23,6 +23,13 @@ const BUFFER_READY_ATTEMPTS: usize = 200;
 const COMPLETION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const COMPLETION_POLLS: usize = 300;
 
+/// Strip the `ble://` (or `ble:`) scheme from a target string.
+fn ble_target(target: &str) -> Option<&str> {
+    target
+        .strip_prefix("ble://")
+        .or_else(|| target.strip_prefix("ble:"))
+}
+
 /// High-level printer interface over a pluggable transport.
 pub struct Printer {
     transport: Box<dyn Transport>,
@@ -56,14 +63,23 @@ impl Printer {
         Ok(Self::new(Box::new(crate::spp_pipe::SppCodec::new(pipe))))
     }
 
-    /// Open a printer from a target string: a `/dev/hidrawN` path selects USB
-    /// HID, anything else is treated as a Bluetooth address.
-    pub fn open_target(target: &str) -> Result<Self> {
+    /// Open a printer from a target string:
+    /// - `/dev/hidrawN` — USB HID
+    /// - `ble://AA:BB:CC:DD:EE:FF` — BLE GATT (needs the `ble` feature)
+    /// - anything else — a Classic Bluetooth RFCOMM address
+    pub async fn open_target(target: &str) -> Result<Self> {
         if target.starts_with("/dev/hidraw") {
-            Self::open_usb(target)
-        } else {
-            Self::open_bt(target)
+            return Self::open_usb(target);
         }
+        if let Some(addr) = ble_target(target) {
+            #[cfg(feature = "ble")]
+            return Self::open_ble(addr).await;
+            #[cfg(not(feature = "ble"))]
+            return Err(Error::InvalidParam(format!(
+                "cannot open {addr} over BLE: built without the `ble` feature"
+            )));
+        }
+        Self::open_bt(target)
     }
 
     /// CHECK_DEVICE (0x12) - verify printer is present.
@@ -635,5 +651,25 @@ impl Printer {
         let (compressed, avg) = compress_buffers(&buffers)?;
         let speed = calc_speed(avg);
         self.print_compressed(&compressed, speed).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ble_targets_are_recognised_by_scheme() {
+        assert_eq!(
+            ble_target("ble://A4:93:40:AF:B0:B5"),
+            Some("A4:93:40:AF:B0:B5")
+        );
+        assert_eq!(
+            ble_target("ble:A4:93:40:AF:B0:B5"),
+            Some("A4:93:40:AF:B0:B5")
+        );
+        // A bare address stays a Classic Bluetooth target.
+        assert_eq!(ble_target("A4:93:40:AF:B0:B5"), None);
+        assert_eq!(ble_target("/dev/hidraw0"), None);
     }
 }

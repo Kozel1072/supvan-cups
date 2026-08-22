@@ -8,3 +8,9 @@ supvan-proto.workspace = true
 env_logger.workspace = true
 clap = { version = "4", features = ["derive"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[features]
+default = []
+# BLE GATT transport for `ble://<address>` targets (E11/E12-class printers).
+# Off by default: it pulls in bluer and BlueZ build dependencies.
+ble = ["supvan-proto/ble"]
