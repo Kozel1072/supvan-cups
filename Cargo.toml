@@ -13,9 +13,7 @@ license = "MIT"
 
 [workspace.dependencies]
 supvan-proto = { path = "crates/supvan-proto" }
-# Path override until 0.9.0 is published — the media page and media_change
-# hook this app relies on live there.
-ipp-printer-app = { version = "0.9.0", path = "../ipp-printer-app" }
+ipp-printer-app = "0.9.0"
 log = "0.4"
 env_logger = "0.11"
 thiserror = "2"

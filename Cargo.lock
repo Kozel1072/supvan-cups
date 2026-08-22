@@ -787,6 +787,8 @@ dependencies = [
 [[package]]
 name = "ipp-printer-app"
 version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b7423fba0a976e39d98b676f30418f21847e3feead26295e542ce35d22d56e2b"
 dependencies = [
  "async-trait",
  "axum",
