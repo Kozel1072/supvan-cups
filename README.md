@@ -161,4 +161,4 @@ surface without a physical fault, layer on `SUPVAN_MOCK_FAIL=media-empty`
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).
