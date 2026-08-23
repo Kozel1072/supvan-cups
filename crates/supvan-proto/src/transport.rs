@@ -33,8 +33,11 @@ pub trait Transport: Send + Sync {
 
     /// Send bulk compressed data as transport-native frames.
     /// If `read_final_response` is true, reads and returns the response after the last frame.
-    async fn send_bulk_data(&self, data: &[u8], read_final_response: bool)
-    -> Result<Option<Vec<u8>>>;
+    async fn send_bulk_data(
+        &self,
+        data: &[u8],
+        read_final_response: bool,
+    ) -> Result<Option<Vec<u8>>>;
 
     /// Parse a status response into PrinterStatus.
     fn parse_status_response(&self, resp: &[u8]) -> Option<PrinterStatus>;

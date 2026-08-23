@@ -48,11 +48,12 @@ impl PrinterHandle {
         }
     }
 
-    /// Stream the compressed raster + speed to the device.
-    pub async fn print_compressed(&self, compressed: &[u8], speed: u16) -> ProtoResult<()> {
+    /// Stream the compressed raster blocks + speed to the device, one block
+    /// per print buffer.
+    pub async fn print_compressed(&self, blocks: &[Vec<u8>], speed: u16) -> ProtoResult<()> {
         match self {
-            Self::Owned(p) => p.print_compressed(compressed, speed).await,
-            Self::Shared(arc) => arc.lock().await.print_compressed(compressed, speed).await,
+            Self::Owned(p) => p.print_compressed(blocks, speed).await,
+            Self::Shared(arc) => arc.lock().await.print_compressed(blocks, speed).await,
         }
     }
 

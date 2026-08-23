@@ -13,6 +13,28 @@ use supvan_proto::buffer::{
 };
 use supvan_proto::compress::{compress_buffers, decompress_lzma};
 
+/// No block may exceed the firmware's 4096-byte receive buffer, unless it is
+/// already down to a single print buffer and cannot be split further.
+fn assert_blocks_fit(blocks: &[Vec<u8>]) {
+    for (i, b) in blocks.iter().enumerate() {
+        let raw = decompress_lzma(b).expect("block roundtrip").len();
+        assert!(
+            b.len() <= 4096 || raw == PRINT_BUF_SIZE,
+            "block {i}: {} compressed bytes spanning {raw} raw — too big to send",
+            b.len()
+        );
+    }
+}
+
+/// Decompress each per-buffer block and concatenate, recovering the original
+/// print-buffer bytes.
+fn decompress_blocks(blocks: &[Vec<u8>]) -> Vec<u8> {
+    blocks
+        .iter()
+        .flat_map(|b| decompress_lzma(b).expect("block roundtrip"))
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -73,8 +95,9 @@ fn run_pipeline(
         PageOptions::default(),
     );
 
-    let (compressed, _avg) = compress_buffers(&buffers).unwrap();
-    let decompressed = decompress_lzma(&compressed).unwrap();
+    let (blocks, _avg) = compress_buffers(&buffers).unwrap();
+    let compressed: Vec<u8> = blocks.concat();
+    let decompressed = decompress_blocks(&blocks);
 
     (buffers, compressed, decompressed)
 }
@@ -212,10 +235,11 @@ fn test_full_pipeline_test_pattern() {
     );
     assert_eq!(buffers.len(), 3);
 
-    let (compressed, avg) = compress_buffers(&buffers).unwrap();
+    let (blocks, avg) = compress_buffers(&buffers).unwrap();
     assert!(avg > 0, "average compressed size should be > 0");
+    assert_blocks_fit(&blocks);
 
-    let decompressed = decompress_lzma(&compressed).unwrap();
+    let decompressed = decompress_blocks(&blocks);
     let mut concat = Vec::with_capacity(buffers.len() * PRINT_BUF_SIZE);
     for buf in &buffers {
         concat.extend_from_slice(buf);
@@ -279,8 +303,9 @@ fn test_pipeline_various_sizes() {
         );
 
         // Compression roundtrip
-        let (compressed, _) = compress_buffers(&buffers).unwrap();
-        let decompressed = decompress_lzma(&compressed).unwrap();
+        let (blocks, _) = compress_buffers(&buffers).unwrap();
+        assert_blocks_fit(&blocks);
+        let decompressed = decompress_blocks(&blocks);
         let mut concat = Vec::with_capacity(buffers.len() * PRINT_BUF_SIZE);
         for buf in &buffers {
             concat.extend_from_slice(buf);
@@ -314,4 +339,42 @@ fn test_pbm_write_read() {
         &data[..],
         "PBM pixel data does not match original"
     );
+}
+
+/// Every column the caller hands in must reach a buffer.
+///
+/// `split_into_buffers` reads image data starting `margin_top` columns in and
+/// sizes the run as `total_cols - margins`, which is right only when the image
+/// itself carries those margin columns. The CUPS path hands over pure
+/// printable area, so it passes zero — with the old default of 8 the label came
+/// out shifted 1mm and 2mm short at the tail.
+#[test]
+fn zero_margins_tile_every_column() {
+    let cols: u16 = 639; // an 80mm label at 8 dots/mm
+    let per_line_byte: u8 = 48; // 384-dot head
+    // Distinct byte per column, so a shift or a gap is unmistakable.
+    let canvas: Vec<u8> = (0..cols as usize)
+        .flat_map(|c| std::iter::repeat_n((c % 251) as u8, per_line_byte as usize))
+        .collect();
+
+    let buffers = split_into_buffers(
+        &canvas,
+        per_line_byte,
+        cols,
+        0,
+        0,
+        Density::uniform(4),
+        PageOptions::default(),
+    );
+
+    let mut sent = Vec::new();
+    let mut advertised = 0u32;
+    for b in &buffers {
+        let n = u16::from_le_bytes([b[4], b[5]]) as usize;
+        advertised += n as u32;
+        sent.extend_from_slice(&b[PRINT_BUF_HEADER..PRINT_BUF_HEADER + n * per_line_byte as usize]);
+    }
+
+    assert_eq!(advertised, cols as u32, "columns dropped between buffers");
+    assert_eq!(sent, canvas, "image shifted or truncated");
 }

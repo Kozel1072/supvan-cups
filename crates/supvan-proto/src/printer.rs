@@ -19,6 +19,14 @@ const READY_ATTEMPTS: usize = 60;
 const PRINTING_ATTEMPTS: usize = 60;
 const BUFFER_READY_ATTEMPTS: usize = 200;
 
+/// Print speed for a page that needs more than one compressed block. The
+/// vendor's fixed value; the head must not outrun the transfers.
+const MULTI_BLOCK_SPEED: u16 = 20;
+
+/// Pause around each block transfer, matching the vendor's own pacing
+/// (`sendMatrix`/`cmdbuffull` both wait this long before acting).
+const BLOCK_SETTLE: Duration = Duration::from_millis(100);
+
 /// Wait-for-completion budget: COMPLETION_POLLS × COMPLETION_POLL_INTERVAL = 30s.
 const COMPLETION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const COMPLETION_POLLS: usize = 300;
@@ -339,14 +347,24 @@ impl Printer {
         // (3-beep) and drops the RFCOMM link before BUF_FULL arrives.
         self.transport.send_bulk_data(compressed, false).await?;
 
-        // 20ms delay after last data packet
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Let the firmware drain the packets before telling it the buffer is
+        // full. The vendor's `cmdbuffull()` waits for every data packet to be
+        // acknowledged and then delays again before sending BUF_FULL; without
+        // the pause the printer can take the whole page and never print it,
+        // leaving `buf_full` stuck set.
+        tokio::time::sleep(BLOCK_SETTLE).await;
 
         // CMD_BUF_FULL: param=compressed_length, param2=speed
         log::info!("BUF_FULL: len={}, speed={}", compressed_len, speed);
         self.transport
             .send_cmd_two(CMD_BUF_FULL, compressed_len, speed)
             .await?;
+
+        // `buf_full` only rises once the firmware has taken the block in.
+        // Reading it too soon sees the *previous* state, so the next block goes
+        // out against a stale "there is room" — which is how eight blocks left
+        // in a second and the buffer never drained.
+        tokio::time::sleep(BLOCK_SETTLE).await;
 
         Ok(())
     }
@@ -358,9 +376,28 @@ impl Printer {
     /// 2. Wait ready
     /// 3. START_PRINT
     /// 4. Wait printing station
-    /// 5. Wait buffer ready + transfer
+    /// 5. Per block: wait for buffer room, then transfer
     /// 6. Wait completion
-    pub async fn print_compressed(&self, compressed: &[u8], speed: u16) -> Result<()> {
+    pub async fn print_compressed(&self, blocks: &[Vec<u8>], speed: u16) -> Result<()> {
+        // A page split across transfers has to print slower. The vendor sets
+        // the speed from the block count alone, not from how well the raster
+        // compressed (`t5080PrintUtils.js`, the CMD_BUF_FULL handler):
+        //
+        //     if (this.imageDataList.length > 1) { this.speed = 20; }
+        //     else                               { this.speed = 60; }
+        //
+        // At full speed the head reaches the end of the first block before the
+        // next one has been decompressed, and the printer stops there — half a
+        // label, no error flag, both blocks acknowledged.
+        let speed = if blocks.len() > 1 {
+            log::info!(
+                "{} blocks: dropping speed {speed} -> {MULTI_BLOCK_SPEED} for a split page",
+                blocks.len()
+            );
+            MULTI_BLOCK_SPEED
+        } else {
+            speed
+        };
         // Step 1: Check device
         if !self.check_device().await? {
             return Err(Error::InvalidResponse("CHECK_DEVICE failed".into()));
@@ -386,30 +423,84 @@ impl Printer {
             .await?
             .ok_or_else(|| Error::InvalidResponse("timeout waiting for printing station".into()))?;
 
-        // Step 5: Wait buffer + transfer
-        let buf_status = self
-            .wait_buffer_ready(BUFFER_READY_ATTEMPTS)
-            .await?
-            .ok_or_else(|| Error::InvalidResponse("timeout waiting for buffer space".into()))?;
-        if buf_status.has_error() {
-            self.stop_print().await?;
-            return Err(Error::InvalidResponse(format!(
-                "printer error: {}",
-                buf_status.error_description().unwrap_or_default()
-            )));
+        // Step 5: Transfer one block per print buffer, waiting for room before
+        // each. `buf_full` is the firmware's flow control — it decompresses
+        // into a single page buffer, so sending the next block before the
+        // previous one has drained overruns it, and the label prints garbled
+        // and stops short. Mirrors the vendor's send loop, which re-checks
+        // status and waits for `MSTA_REG.BufSta == 0` between blocks.
+        for (i, block) in blocks.iter().enumerate() {
+            let buf_status = self
+                .wait_buffer_ready(BUFFER_READY_ATTEMPTS)
+                .await?
+                .ok_or_else(|| {
+                    Error::InvalidResponse(format!(
+                        "timeout waiting for buffer space before block {}/{}",
+                        i + 1,
+                        blocks.len()
+                    ))
+                })?;
+            if buf_status.has_error() {
+                self.stop_print().await?;
+                return Err(Error::InvalidResponse(format!(
+                    "printer error: {}",
+                    buf_status.error_description().unwrap_or_default()
+                )));
+            }
+            log::info!(
+                "block {}/{}: {} bytes, before: {}",
+                i + 1,
+                blocks.len(),
+                block.len(),
+                buf_status.summary()
+            );
+            self.transfer_compressed(block, speed).await?;
+            // What the firmware made of it. A block that is accepted and then
+            // silently dropped looks identical to one that printed unless the
+            // registers are on record either side of the transfer.
+            if let Some(after) = self.query_status().await? {
+                log::info!(
+                    "block {}/{}: after:  {}",
+                    i + 1,
+                    blocks.len(),
+                    after.summary()
+                );
+            }
         }
-        self.transfer_compressed(compressed, speed).await?;
 
-        // Step 6: Wait completion
+        // Step 6: Wait completion.
+        //
+        // `!printing && !device_busy` alone is not completion: right after the
+        // last block the firmware may not have started yet, so both read false
+        // and we would report success on a page that never printed. The buffer
+        // has to have drained too — a stuck `buf_full` is exactly the state a
+        // printer wedges in when it has been fed faster than it can print.
         for _ in 0..COMPLETION_POLLS {
             tokio::time::sleep(COMPLETION_POLL_INTERVAL).await;
-            if let Some(s) = self.query_status().await?
-                && !s.printing
-                && !s.device_busy
-            {
-                log::info!("print complete");
-                return Ok(());
+            if let Some(s) = self.query_status().await? {
+                log::debug!("completion poll: {}", s.summary());
+                if s.has_error() {
+                    return Err(Error::InvalidResponse(format!(
+                        "printer error while printing: {}",
+                        s.error_description().unwrap_or_default()
+                    )));
+                }
+                if !s.printing && !s.device_busy && !s.buf_full {
+                    log::info!("print complete");
+                    return Ok(());
+                }
             }
+        }
+        // Falling out here with the buffer still full means the firmware took
+        // the page and never printed it; say so rather than blaming the poll.
+        if let Some(s) = self.query_status().await?
+            && s.buf_full
+        {
+            return Err(Error::InvalidResponse(
+                "printer buffer still full after the print budget — the page was accepted but \
+                 never printed"
+                    .into(),
+            ));
         }
 
         log::warn!("timeout waiting for print completion");

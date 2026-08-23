@@ -2,7 +2,7 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use ipp_printer_app::{JobFailure, JobOptions, PrinterHandle, PrinterReason, RasterDriver};
-use supvan_proto::bitmap::{DEFAULT_MARGIN_DOTS, center_in_printhead, raster_to_column_major};
+use supvan_proto::bitmap::{center_in_printhead, raster_to_column_major};
 use supvan_proto::buffer::{Density, PageOptions, split_into_buffers};
 use supvan_proto::compress::compress_buffers;
 use supvan_proto::dither::{DitherMode, Ditherer, to_gray_line};
@@ -185,12 +185,18 @@ impl KsJob {
             center_in_printhead(&col_data, num_cols, self.width, self.printhead_width_dots);
         dump.printhead_pbm(&canvas, num_cols, canvas_bpl, self.printhead_width_dots);
 
+        // Zero margins: `split_into_buffers` treats them as leading/trailing
+        // columns *of the image*, which is right for the vendor's composed
+        // bitmap but not here — the IPP layer declares zero hard margins, so
+        // CUPS hands us exactly the printable area. Passing the default 8 made
+        // the tiler skip the first 8 columns and stop 8 short of the end,
+        // shifting the label 1mm and losing 2mm off the tail.
         let buffers = split_into_buffers(
             &canvas,
             canvas_bpl as u8,
             num_cols as u16,
-            DEFAULT_MARGIN_DOTS,
-            DEFAULT_MARGIN_DOTS,
+            0,
+            0,
             // IPP carries one print-quality knob, so both trims move together —
             // the vendor's own behaviour when its packed density fits in a byte.
             Density::uniform(self.density),

@@ -1,5 +1,13 @@
 use crate::error::{Error, Result};
 
+/// Largest compressed block the firmware will accept in one transfer — the
+/// size of its receive buffer.
+const MAX_COMPRESSED_BLOCK: usize = crate::buffer::PRINT_BUF_SIZE;
+
+/// Most print buffers the vendor packs into one compressed block
+/// (`T50PlusPrint.bufferMAXCount`).
+const BUFFER_MAX_COUNT: usize = 4;
+
 /// Compress data using LZMA1 (alone format) with printer-compatible parameters.
 ///
 /// Parameters: dict_size=8192, lc=3, lp=0, pb=2 (from Android LzmaUtils.java).
@@ -74,30 +82,73 @@ pub fn decompress_lzma(data: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Compress concatenated print buffers for transfer.
+/// Split print buffers into the LZMA blocks the firmware expects, one block
+/// per transfer.
 ///
-/// Takes a slice of 4096-byte print buffers, concatenates them, and compresses
-/// as a single LZMA stream. The printer's decoder reads the 14-byte header at
-/// each 4096-byte boundary internally, so a single LZMA stream covering N
-/// buffers is the right thing to send.
+/// Pack up to [`BUFFER_MAX_COUNT`] buffers, compress, and shrink the group
+/// until the result fits the firmware's receive buffer:
 ///
-/// Returns (compressed_data, average_compressed_per_buffer).
+/// ```java
+/// int min = Math.min(this.bufferMAXCount, list.size());
+/// do {
+///     for (int i = 0; i < min; i++) byteArrayOutputStream.write(list.get(i));
+///     bArr = LzmaUtils.LzmaEncode(byteArrayOutputStream.toByteArray());
+///     min--;
+/// } while (bArr.length > 4096);
+/// ```
+///
+/// (`T80ProPrint.multiCompression`; `T50PlusPrint` carries the same
+/// `bufferMAXCount = 4` but JADX could not decompile its copy.)
+///
+/// Both bounds matter. One stream for a whole page overruns the receive buffer
+/// — an 80mm label compresses to 4533 bytes — and prints garbled. One block
+/// per buffer is equally wrong: eight transfers for the same page leaves the
+/// printer marking a few millimetres and stopping.
+///
+/// Returns the blocks and the mean compressed size per buffer, which feeds
+/// `calc_speed`.
 pub fn compress_buffers(
     buffers: &[[u8; crate::buffer::PRINT_BUF_SIZE]],
-) -> Result<(Vec<u8>, usize)> {
+) -> Result<(Vec<Vec<u8>>, usize)> {
     if buffers.is_empty() {
         return Err(Error::InvalidParam("no buffers to compress".into()));
     }
 
-    let mut concat = Vec::with_capacity(buffers.len() * crate::buffer::PRINT_BUF_SIZE);
-    for buf in buffers {
-        concat.extend_from_slice(buf);
+    let mut blocks: Vec<Vec<u8>> = Vec::new();
+    let mut next = 0usize;
+    while next < buffers.len() {
+        let mut take = BUFFER_MAX_COUNT.min(buffers.len() - next);
+        let block = loop {
+            let group: Vec<u8> = buffers[next..next + take].concat();
+            let z = compress_lzma(&group)?;
+            if z.len() <= MAX_COMPRESSED_BLOCK {
+                break z;
+            }
+            if take == 1 {
+                // No smaller group to fall back to. Send it and say so —
+                // raster this incompressible is not what the firmware is
+                // sized for.
+                log::warn!(
+                    "print buffer compresses to {} bytes, past the \
+                     {MAX_COMPRESSED_BLOCK}-byte receive buffer; sending anyway",
+                    z.len()
+                );
+                break z;
+            }
+            take -= 1;
+        };
+        blocks.push(block);
+        next += take;
     }
 
-    let compressed = compress_lzma(&concat)?;
-    let avg = compressed.len() / buffers.len();
-
-    Ok((compressed, avg))
+    let avg = blocks.iter().map(Vec::len).sum::<usize>() / buffers.len();
+    log::debug!(
+        "compress: {} buffers -> {} block(s) {:?}",
+        buffers.len(),
+        blocks.len(),
+        blocks.iter().map(Vec::len).collect::<Vec<_>>()
+    );
+    Ok((blocks, avg))
 }
 
 #[cfg(test)]
@@ -138,12 +189,45 @@ mod tests {
         assert_eq!(decompressed, data);
     }
 
+    /// Compressible buffers pack up to the vendor's cap, not all-in-one: a
+    /// whole page in a single stream overruns the firmware's receive buffer.
     #[test]
-    fn test_compress_buffers() {
-        let buf = [0u8; 4096];
-        let buffers = vec![buf; 3];
-        let (compressed, avg) = compress_buffers(&buffers).unwrap();
-        assert!(compressed.len() > 13); // at least header
+    fn packing_is_capped_at_the_vendor_group_size() {
+        let buffers = vec![[0u8; 4096]; 9];
+        let (blocks, avg) = compress_buffers(&buffers).unwrap();
+        assert_eq!(blocks.len(), 3, "9 buffers pack 4 + 4 + 1");
         assert!(avg > 0);
+        let round: Vec<u8> = blocks
+            .iter()
+            .flat_map(|b| decompress_lzma(b).unwrap())
+            .collect();
+        assert_eq!(round, buffers.concat(), "buffers lost or reordered");
+    }
+
+    /// A group too big compressed shrinks until it fits, rather than being
+    /// sent over the receive-buffer size.
+    #[test]
+    fn oversized_groups_shrink_to_fit() {
+        // Pseudo-random bytes: LZMA cannot shrink these, so four together
+        // would compress to roughly 16KB and must be split.
+        let mut seed = 0x12345678u32;
+        let buffers: Vec<[u8; 4096]> = (0..4)
+            .map(|_| {
+                let mut b = [0u8; 4096];
+                for byte in b.iter_mut() {
+                    seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                    *byte = (seed >> 24) as u8;
+                }
+                b
+            })
+            .collect();
+
+        let (blocks, _) = compress_buffers(&buffers).unwrap();
+        assert_eq!(blocks.len(), 4, "incompressible data cannot be grouped");
+        let round: Vec<u8> = blocks
+            .iter()
+            .flat_map(|b| decompress_lzma(b).unwrap())
+            .collect();
+        assert_eq!(round, buffers.concat());
     }
 }

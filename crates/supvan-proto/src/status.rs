@@ -32,7 +32,18 @@ pub struct PrinterStatus {
     pub label_not_installed: bool,
     // Bytes 18-19
     pub print_count: u16,
+    /// The four raw status registers, in decode order: MSTA low/high, FSTA
+    /// low/high.
+    ///
+    /// Kept so a caller can show bits this struct does not name. The firmware
+    /// sets more of them than we have identified, and a print that stops with
+    /// every known flag clear is exactly when the unnamed ones matter.
+    pub regs: [u8; 4],
 }
+
+/// Bits [`decode_status_bits`] gives a name to, per register. Anything set
+/// outside these is something the firmware is reporting that we do not read.
+pub const DECODED_BITS: [u8; 4] = [0x7f, 0x0c, 0x58, 0x01];
 
 impl PrinterStatus {
     /// Error flags paired with their human-readable descriptions, in report
@@ -57,6 +68,40 @@ impl PrinterStatus {
     }
 
     /// Return a human-readable description of any errors.
+    /// One-line summary for logs: the flags that are set, plus the raw
+    /// registers so an undecoded bit is still visible in a trace.
+    pub fn summary(&self) -> String {
+        let mut set: Vec<&str> = Vec::new();
+        for (on, name) in [
+            (self.printing, "printing"),
+            (self.device_busy, "busy"),
+            (self.buf_full, "buf_full"),
+            (self.cover_open, "cover_open"),
+            (self.label_end, "label_end"),
+            (self.label_not_installed, "no_label"),
+            (self.label_rw_error, "label_rw_err"),
+            (self.label_mode_error, "label_mode_err"),
+            (self.ribbon_end, "ribbon_end"),
+            (self.ribbon_rw_error, "ribbon_rw_err"),
+            (self.head_temp_high, "head_hot"),
+            (self.low_battery, "low_batt"),
+        ] {
+            if on {
+                set.push(name);
+            }
+        }
+        let flags = if set.is_empty() {
+            "-".to_string()
+        } else {
+            set.join(",")
+        };
+        let [a, b, c, d] = self.regs;
+        format!(
+            "[{flags}] count={} regs={a:02x} {b:02x} {c:02x} {d:02x}",
+            self.print_count
+        )
+    }
+
     pub fn error_description(&self) -> Option<String> {
         let errors: Vec<&str> = self
             .error_flags()
@@ -136,6 +181,7 @@ pub(crate) fn decode_status_bits(
         printing: b2 & 0x40 != 0,
         label_not_installed: b3 & 0x01 != 0,
         print_count,
+        regs: [b0, b1, b2, b3],
     }
 }
 

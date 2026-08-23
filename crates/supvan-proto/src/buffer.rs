@@ -306,6 +306,14 @@ pub fn split_into_banded_buffers(
         }
     }
 
+    log::debug!(
+        "split: {} cols x {per_line_byte}B/line, margins {margin_top}/{margin_bottom}, \
+         {} planes -> {} buffers (max {max_cols} cols each)",
+        bands.iter().map(|b| b.cols as u32).sum::<u32>(),
+        planes,
+        chunks.len(),
+    );
+
     let last = chunks.len().saturating_sub(1);
     chunks
         .iter()
@@ -317,6 +325,14 @@ pub fn split_into_banded_buffers(
                 .get(img_start..img_end.min(image_data.len()))
                 .unwrap_or(&[]);
 
+            log::trace!(
+                "  buffer {i}: cols {start_col}..{} ({cols_in_buf}), page_st={} page_end={} \
+                 prt_end={}",
+                start_col as u32 + cols_in_buf as u32,
+                i == 0,
+                i == last,
+                i == last,
+            );
             build_print_buffer(&PrintBufferParams {
                 image_data: img_chunk,
                 per_line_byte,
