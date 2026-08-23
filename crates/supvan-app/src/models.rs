@@ -104,20 +104,38 @@ fn registry() -> &'static Registry {
 const EMBEDDED_MODELS: &str = include_str!("../../../data/models.toml");
 
 pub fn load() {
-    let (contents, source) = match find_toml_path() {
-        Some(path) => {
-            let c = std::fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("failed to read {path}: {e}"));
-            (c, path)
-        }
-        None => (EMBEDDED_MODELS.to_string(), "<embedded>".to_string()),
+    let registry = match find_toml_path() {
+        Some(path) => match read_and_build(&path) {
+            Ok(r) => r,
+            Err(e) => {
+                // A stale on-disk table must not take the daemon down: an
+                // upgrade that adds a field leaves the old /usr/share copy
+                // unreadable, and the embedded one is always in step with
+                // this binary.
+                log::error!("models: ignoring {path}: {e}; falling back to the embedded table");
+                embedded_registry()
+            }
+        },
+        None => embedded_registry(),
     };
-    load_from_str(&contents, &source);
+
+    if REGISTRY.set(registry).is_err() {
+        panic!("models::load() called more than once");
+    }
 }
 
-fn load_from_str(contents: &str, source: &str) {
+fn embedded_registry() -> Registry {
+    build_registry(EMBEDDED_MODELS, "<embedded>").expect("the embedded models.toml must be valid")
+}
+
+fn read_and_build(path: &str) -> Result<Registry, String> {
+    let contents = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    build_registry(&contents, path)
+}
+
+fn build_registry(contents: &str, source: &str) -> Result<Registry, String> {
     let toml: ModelsToml =
-        toml::from_str(contents).unwrap_or_else(|e| panic!("failed to parse {source}: {e}"));
+        toml::from_str(contents).map_err(|e| format!("failed to parse {source}: {e}"))?;
 
     let families: Vec<DriverFamily> = toml
         .families
@@ -154,33 +172,30 @@ fn load_from_str(contents: &str, source: &str) {
 
     let default_family_idx = *family_index
         .get("supvan_t50")
-        .expect("models.toml must define a 'supvan_t50' family");
+        .ok_or_else(|| format!("{source}: no 'supvan_t50' family"))?;
 
-    let models: Vec<UsbModel> = toml
-        .models
-        .iter()
-        .map(|m| {
-            assert!(
-                family_index.contains_key(m.family.as_str()),
-                "model '{}' references unknown family '{}'",
-                m.name,
-                m.family
-            );
-            UsbModel {
-                pid: m.pid.clone(),
-                name: m.name.clone(),
-            }
-        })
-        .collect();
+    let mut models = Vec::with_capacity(toml.models.len());
+    for m in &toml.models {
+        if !family_index.contains_key(m.family.as_str()) {
+            return Err(format!(
+                "{source}: model '{}' references unknown family '{}'",
+                m.name, m.family
+            ));
+        }
+        models.push(UsbModel {
+            pid: m.pid.clone(),
+            name: m.name.clone(),
+        });
+    }
 
     let mut bt_prefixes: Vec<BtPrefix> = Vec::new();
     for entry in &toml.bt_names {
-        let family_idx = *family_index.get(entry.family.as_str()).unwrap_or_else(|| {
-            panic!(
-                "bt_names entry '{}' references unknown family '{}'",
+        let family_idx = *family_index.get(entry.family.as_str()).ok_or_else(|| {
+            format!(
+                "{source}: bt_names entry '{}' references unknown family '{}'",
                 entry.model, entry.family
             )
-        });
+        })?;
         for prefix in &entry.prefixes {
             bt_prefixes.push(BtPrefix {
                 prefix: prefix.to_lowercase(),
@@ -191,17 +206,12 @@ fn load_from_str(contents: &str, source: &str) {
     }
     bt_prefixes.sort_by_key(|p| std::cmp::Reverse(p.prefix.len()));
 
-    if REGISTRY
-        .set(Registry {
-            families,
-            models,
-            bt_prefixes,
-            default_family_idx,
-        })
-        .is_err()
-    {
-        panic!("models::load() called more than once");
-    }
+    Ok(Registry {
+        families,
+        models,
+        bt_prefixes,
+        default_family_idx,
+    })
 }
 
 /// Locate a `models.toml` override on disk, or `None` to use [`EMBEDDED_MODELS`].
@@ -282,6 +292,34 @@ pub fn is_matching_bt_name(name: &str) -> bool {
     match_bt_prefix(&lower).is_some()
 }
 
+/// Supvan's assigned MAC OUI.
+pub fn is_supvan_oui(addr: &str) -> bool {
+    addr.get(..8)
+        .is_some_and(|oui| oui.eq_ignore_ascii_case("A4:93:40"))
+}
+
+/// True for the firmware *serial name* a printer broadcasts: a `T`/`G`/`D`
+/// family letter, a hardware code, then the unit serial (`T0143F2408183024`
+/// for an E10, `T0117A2410211517` for a T50M Pro).
+///
+/// The prefix table can only list codes the vendor app knows about, so a unit
+/// whose code postdates it would be invisible to discovery. Safe as a generic
+/// fallback when paired with [`is_supvan_oui`].
+pub fn is_supvan_serial_name(name: &str) -> bool {
+    let b = name.as_bytes();
+    b.len() >= 3
+        && matches!(b[0], b'T' | b'G' | b'D')
+        && b[1].is_ascii_digit()
+        && b[2].is_ascii_digit()
+}
+
+/// Whether a Bluetooth device looks like a Supvan printer, given both its
+/// address and advertised name. Accepts known prefixes anywhere, plus unknown
+/// firmware serial names inside the Supvan OUI.
+pub fn is_matching_bt_device(addr: &str, name: &str) -> bool {
+    is_matching_bt_name(name) || (is_supvan_oui(addr) && is_supvan_serial_name(name))
+}
+
 /// Parse the MDL field from an IEEE 1284 device ID string.
 ///
 /// Example: `"MFG:Supvan;MDL:T50M Pro;CMD:SUPVAN;"` → `Some("T50M Pro")`
@@ -300,7 +338,9 @@ mod tests {
     fn init() {
         static ONCE: std::sync::Once = std::sync::Once::new();
         // Always the embedded table, never a stale system install.
-        ONCE.call_once(|| load_from_str(EMBEDDED_MODELS, "<embedded>"));
+        ONCE.call_once(|| {
+            let _ = REGISTRY.set(embedded_registry());
+        });
     }
 
     #[test]
@@ -348,5 +388,62 @@ mod tests {
         assert_eq!(f.driver_name.to_str().unwrap(), "supvan_t80");
         let f = family_for_model_hint("E11");
         assert_eq!(f.driver_name.to_str().unwrap(), "supvan_t50");
+    }
+
+    #[test]
+    fn unknown_hardware_codes_still_pass_discovery() {
+        init();
+        // A code the vendor tables don't list — a unit newer than the app we
+        // transcribed. Unknown to the prefix table...
+        assert_eq!(bt_model_for_name("T0999X2501010001"), None);
+        assert!(!is_matching_bt_name("T0999X2501010001"));
+        // ...but still discoverable inside Supvan's OUI.
+        assert!(is_matching_bt_device(
+            "A4:93:40:11:22:33",
+            "T0999X2501010001"
+        ));
+        // and it lands on the default family rather than being dropped.
+        let f = family_for_model_hint("T0999X2501010001");
+        assert_eq!(f.driver_name.to_str().unwrap(), "supvan_t50");
+    }
+
+    #[test]
+    fn the_oui_fallback_does_not_admit_other_vendors() {
+        init();
+        // Right name shape, wrong OUI.
+        assert!(!is_matching_bt_device(
+            "00:11:22:33:44:55",
+            "T0999X2501010001"
+        ));
+        // Right OUI, wrong name shape.
+        assert!(!is_matching_bt_device("A4:93:40:11:22:33", "Some Headphones"));
+    }
+
+    #[test]
+    fn a_broken_on_disk_table_is_rejected_not_fatal() {
+        // What a stale /usr/share copy looks like after a schema change: the
+        // daemon must not die on it.
+        assert!(build_registry("families = []\nmodels = []\n", "<bad>").is_err());
+        assert!(build_registry("this is not toml", "<bad>").is_err());
+        // A table whose entries point at families it never defines.
+        let orphan = r#"
+models = []
+
+[[families]]
+name = "supvan_t50"
+description = "T50"
+dpi = 203
+printhead_dots = 384
+media_mm = [[40, 30]]
+
+[[bt_names]]
+model = "Nope"
+family = "supvan_missing"
+prefixes = ["x"]
+"#;
+        let Err(err) = build_registry(orphan, "<bad>") else {
+            panic!("an orphan family reference must be rejected");
+        };
+        assert!(err.contains("unknown family"), "{err}");
     }
 }
