@@ -23,7 +23,7 @@ fn dump_dir() -> Option<&'static PathBuf> {
             .map(PathBuf::from);
         let resolved = if let Some(p) = explicit {
             Some(p)
-        } else if crate::util::is_mock_mode() {
+        } else if supvan_discover::util::is_mock_mode() {
             let xdg = std::env::var("XDG_RUNTIME_DIR")
                 .ok()
                 .filter(|s| !s.is_empty())

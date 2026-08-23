@@ -1,0 +1,19 @@
+[package]
+name = "supvan-discover"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+supvan-proto = { workspace = true }
+log = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+dbus = "0.9"
+tokio = { workspace = true, features = ["time"] }
+# BLE GATT discovery (LE scan). Off by default — pulls bluer + BlueZ build deps.
+bluer = { version = "0.17", optional = true, features = ["bluetoothd"] }
+futures-util = { version = "0.3", optional = true }
+
+[features]
+default = []
+ble = ["dep:bluer", "dep:futures-util", "supvan-proto/ble"]

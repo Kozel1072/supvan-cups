@@ -9,7 +9,7 @@ use print_raster::reader::{RasterPageReader, RasterReader};
 use tokio_util::compat::TokioAsyncReadCompatExt;
 
 use crate::job::KsJob;
-use crate::models;
+use supvan_discover::models;
 
 /// Printhead resolution in dots per millimetre (matches supvan-proto).
 const DOTS_PER_MM: i32 = 8;

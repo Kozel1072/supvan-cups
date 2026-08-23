@@ -10,11 +10,11 @@ use ipp_printer_app::{
 use parking_lot::RwLock;
 use supvan_proto::rfid::{RfidMaterial, heat_presets};
 
-use crate::ble_discover::BleCandidate;
-use crate::discover::BtCandidate;
 use crate::ipp_job::{config_from_family, run_cups_raster_job};
-use crate::models;
-use crate::usb_discover::UsbCandidate;
+use supvan_discover::ble::BleCandidate;
+use supvan_discover::bt::BtCandidate;
+use supvan_discover::models;
+use supvan_discover::usb::UsbCandidate;
 
 /// Threshold below which the printer-state-reasons gets the MEDIA_LOW flag.
 /// Conservative — most label-printer ops want a few minutes of warning.
@@ -65,7 +65,7 @@ fn slug(name: &str) -> String {
 #[async_trait::async_trait]
 impl DeviceBackend for SupvanDeviceBackend {
     async fn list(&self) -> Vec<DiscoveredDevice> {
-        if crate::util::is_mock_mode() {
+        if supvan_discover::util::is_mock_mode() {
             let family = models::default_family();
             let driver = family.driver_name.to_string_lossy();
             let mdl = String::from_utf8_lossy(&family.make_and_model).into_owned();
@@ -81,9 +81,9 @@ impl DeviceBackend for SupvanDeviceBackend {
         // Collect all candidates. USB probes RD_DEV_NAME silently per device;
         // BT pulls the firmware-reported name from BlueZ; BLE scans for
         // E11/E12-class advertisers (no-op without the `ble` feature).
-        let usb = crate::usb_discover::list_candidates().await;
-        let bt = crate::discover::list_candidates();
-        let ble = crate::ble_discover::list_candidates().await;
+        let usb = supvan_discover::usb::list_candidates().await;
+        let bt = supvan_discover::bt::list_candidates();
+        let ble = supvan_discover::ble::list_candidates().await;
 
         // Group by printer-reported name. USB candidates carry their
         // `device_sn` (parsed from `RETURN_MAT` at offset 40); BT and BLE carry

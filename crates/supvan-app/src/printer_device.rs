@@ -6,7 +6,7 @@ use supvan_proto::printer::Printer;
 use supvan_proto::status::PrinterStatus;
 use tokio::sync::Mutex;
 
-use crate::util::is_mock_mode;
+use supvan_discover::util::is_mock_mode;
 
 /// A Printer that may be owned by this `KsDevice` (USB, fresh BT) or shared
 /// behind a `Mutex` so multiple short-lived `KsDevice` instances can reuse a

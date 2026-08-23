@@ -9,18 +9,13 @@
 //! takes no arguments; it is configured via `SUPVAN_*` environment variables.
 
 mod battery_provider;
-mod ble_discover;
 mod device;
-mod discover;
 mod dump;
 mod ipp_job;
 mod ipp_server;
 mod job;
 mod mock;
-mod models;
 mod printer_device;
-mod usb_discover;
-mod util;
 
 use std::env;
 

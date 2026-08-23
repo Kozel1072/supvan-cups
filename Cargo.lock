@@ -1435,6 +1435,7 @@ dependencies = [
  "print_raster",
  "serde",
  "serde_json",
+ "supvan-discover",
  "supvan-proto",
  "tokio",
  "tokio-util",
@@ -1447,8 +1448,23 @@ version = "0.5.1"
 dependencies = [
  "clap",
  "env_logger",
+ "supvan-discover",
  "supvan-proto",
  "tokio",
+]
+
+[[package]]
+name = "supvan-discover"
+version = "0.5.1"
+dependencies = [
+ "bluer",
+ "dbus",
+ "futures-util",
+ "log",
+ "serde",
+ "supvan-proto",
+ "tokio",
+ "toml",
 ]
 
 [[package]]
@@ -1891,3 +1907,7 @@ checksum = "27bc9d5b815bc103f142aa054f561d9187d191692ec7c2d1e2b4737f8dbd7296"
 dependencies = [
  "zune-core",
 ]
+
+[[patch.unused]]
+name = "ipp-printer-app"
+version = "0.10.0"
