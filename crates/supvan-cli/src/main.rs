@@ -208,6 +208,47 @@ async fn connect(target: &str) -> Result<Printer, Box<dyn Error>> {
     Ok(printer)
 }
 
+/// Every status flag, plus the raw registers.
+///
+/// The firmware sets bits we have no name for, so the registers are shown as
+/// well and any undecoded bit is called out — a print that stops with all the
+/// known flags clear is precisely when those matter.
+fn print_status(s: &supvan_proto::status::PrinterStatus) {
+    for (name, value) in [
+        ("printing", s.printing),
+        ("device_busy", s.device_busy),
+        ("buf_full", s.buf_full),
+        ("cover_open", s.cover_open),
+        ("insert_usb", s.insert_usb),
+        ("label_end", s.label_end),
+        ("label_not_installed", s.label_not_installed),
+        ("label_rw_error", s.label_rw_error),
+        ("label_mode_error", s.label_mode_error),
+        ("ribbon_end", s.ribbon_end),
+        ("ribbon_rw_error", s.ribbon_rw_error),
+        ("head_temp_high", s.head_temp_high),
+        ("low_battery", s.low_battery),
+    ] {
+        eprintln!("  {name:<20} {value}");
+    }
+    eprintln!("  {:<20} {}", "print_count", s.print_count);
+
+    const REG_NAMES: [&str; 4] = ["MSTA lo", "MSTA hi", "FSTA lo", "FSTA hi"];
+    eprintln!("  registers:");
+    for (i, (name, raw)) in REG_NAMES.iter().zip(s.regs).enumerate() {
+        let unknown = raw & !supvan_proto::status::DECODED_BITS[i];
+        let note = if unknown != 0 {
+            format!("  <- undecoded bits {unknown:#010b}")
+        } else {
+            String::new()
+        };
+        eprintln!("    {name}  {raw:#04x}  {raw:08b}{note}");
+    }
+    if let Some(errs) = s.error_description() {
+        eprintln!("  ERRORS: {errs}");
+    }
+}
+
 async fn cmd_probe(target: &str) -> CliResult {
     let printer = connect(target).await?;
 
@@ -219,15 +260,7 @@ async fn cmd_probe(target: &str) -> CliResult {
 
     if let Some(status) = printer.query_status().await? {
         eprintln!("Status:");
-        eprintln!("  printing:     {}", status.printing);
-        eprintln!("  device_busy:  {}", status.device_busy);
-        eprintln!("  buf_full:     {}", status.buf_full);
-        eprintln!("  low_battery:  {}", status.low_battery);
-        eprintln!("  cover_open:   {}", status.cover_open);
-        eprintln!("  print_count:  {}", status.print_count);
-        if let Some(errs) = status.error_description() {
-            eprintln!("  ERRORS:       {errs}");
-        }
+        print_status(&status);
     }
 
     if let Some(name) = printer.read_device_name().await? {
