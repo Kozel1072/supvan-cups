@@ -9,6 +9,33 @@ minor version).
 
 ### Fixed
 
+- **Contone rasters printed solid black.** The IPP layer advertises `SRGB24`,
+  so a Ghostscript-rendered text label arrives as 24 bpp; only 8 bpp was
+  dithered, and 24 bpp had its raw RGB copied into the 1-bit page buffer, where
+  white `0xFF` became eight set dots. Adopted from
+  [huntj88/supvan-cups#1](https://github.com/huntj88/supvan-cups/pull/1)
+  (heeen/supvan-cups#8), verified on physical E10pro hardware by James Hunt.
+- **A padded 1 bpp source sheared every row** — the page buffer was sized from
+  the incoming `bytes_per_line` while `raster_to_column_major` re-reads it at
+  `ceil(width/8)`. `KsJob::start` now derives its own stride. Same source.
+- **Pages wider than the printhead lost one whole edge.** `center_in_printhead`
+  kept the leading bytes; the media runs centred under the head, so a 50 mm
+  label on the T50's 48 mm head lost 2 mm off the right instead of 1 mm off each
+  side. Both branches now measure against the head's usable width, which also
+  stops the 190-dot G series walking past its last column. Same source.
+- **Printers with an unlisted hardware code are discoverable again.** The prefix
+  table only covers codes the vendor app knows, so a newer unit was invisible;
+  a firmware serial name inside Supvan's `A4:93:40` OUI is now accepted as a
+  generic fallback and lands on the default family. Classic discovery gates
+  pairing on SPP, treating an empty EIR UUID list as "unknown" rather than "no".
+  Adopted from [huntj88/supvan-cups#3](https://github.com/huntj88/supvan-cups/pull/3).
+- **A stale `models.toml` no longer kills the daemon at startup.** The on-disk
+  copy under `/usr/share` is read before the embedded one, so any schema change
+  stranded an installed table and panicked `models::load()`. It now logs and
+  falls back to the embedded table. Same source.
+
+### Fixed
+
 - **Bluetooth discovery could not match any real printer name.** Printers
   advertise a firmware serial (`T0182A2507162197`), never a marketing name, so
   the old `bt_patterns` entries (`"t50"`, `"e10"`, `"e11"`, …) matched nothing
