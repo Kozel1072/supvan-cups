@@ -786,9 +786,9 @@ dependencies = [
 
 [[package]]
 name = "ipp-printer-app"
-version = "0.9.0"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b7423fba0a976e39d98b676f30418f21847e3feead26295e542ce35d22d56e2b"
+checksum = "d9e158a55aa8b77ff5d4163443267f48b8224e64d4e03a410c7067f02caa5053"
 dependencies = [
  "async-trait",
  "axum",
@@ -1907,7 +1907,3 @@ checksum = "27bc9d5b815bc103f142aa054f561d9187d191692ec7c2d1e2b4737f8dbd7296"
 dependencies = [
  "zune-core",
 ]
-
-[[patch.unused]]
-name = "ipp-printer-app"
-version = "0.10.0"
