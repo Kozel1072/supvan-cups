@@ -13,13 +13,13 @@ use supvan_proto::buffer::{
 };
 use supvan_proto::compress::{compress_buffers, decompress_lzma};
 
-/// No block may exceed the firmware's 4096-byte receive buffer, unless it is
+/// No block may exceed the 4000-byte cap the vendor packs to, unless it is
 /// already down to a single print buffer and cannot be split further.
 fn assert_blocks_fit(blocks: &[Vec<u8>]) {
     for (i, b) in blocks.iter().enumerate() {
         let raw = decompress_lzma(b).expect("block roundtrip").len();
         assert!(
-            b.len() <= 4096 || raw == PRINT_BUF_SIZE,
+            b.len() <= 4000 || raw == PRINT_BUF_SIZE,
             "block {i}: {} compressed bytes spanning {raw} raw — too big to send",
             b.len()
         );
@@ -312,6 +312,50 @@ fn test_pipeline_various_sizes() {
         }
         assert_eq!(decompressed, concat, "{w_mm}x{h_mm}mm: roundtrip mismatch");
     }
+}
+
+/// A 50×80 mm page is 8 print buffers, and it has to travel as a single
+/// compressed block.
+///
+/// Split across two, the printer lays down only the first block's worth: half
+/// a label, no error flag, both blocks acknowledged, and CUPS reporting the job
+/// `completed`. Eight buffers sit well under the vendor's per-block cap, so the
+/// packing must not split them.
+#[test]
+fn a_long_page_travels_as_one_block() {
+    // The head canvas is 48 mm (384 dots) wide once the page is centred; the
+    // feed direction carries the page height.
+    let width = PRINTHEAD_WIDTH_DOTS;
+    let height = 80 * DOTS_PER_MM;
+    let bytes_per_row = width.div_ceil(8) as usize;
+
+    // Text-like rule pattern — mostly white with thin strokes, which is what a
+    // real label raster looks like.
+    let mut raster = vec![0u8; bytes_per_row * height as usize];
+    for y in (4..height as usize).step_by(13) {
+        for x in 2..bytes_per_row - 2 {
+            raster[y * bytes_per_row + x] = 0xF0;
+        }
+    }
+
+    let (col_data, num_cols, _) = raster_to_column_major(&raster, width, height);
+    let (canvas, canvas_bpl) =
+        center_in_printhead(&col_data, num_cols, width, PRINTHEAD_WIDTH_DOTS);
+    let buffers = split_into_buffers(
+        &canvas,
+        canvas_bpl as u8,
+        num_cols as u16,
+        DEFAULT_MARGIN_DOTS,
+        DEFAULT_MARGIN_DOTS,
+        Density::uniform(4),
+        PageOptions::default(),
+    );
+    assert_eq!(buffers.len(), 8, "a 50x80mm page is 8 print buffers");
+
+    let (blocks, _) = compress_buffers(&buffers).unwrap();
+    assert_eq!(blocks.len(), 1, "the page must travel as one block");
+    assert_blocks_fit(&blocks);
+    assert_eq!(decompress_blocks(&blocks), buffers.concat());
 }
 
 /// PBM P4 write/read roundtrip.

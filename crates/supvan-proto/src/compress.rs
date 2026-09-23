@@ -1,12 +1,21 @@
 use crate::error::{Error, Result};
 
-/// Largest compressed block the firmware will accept in one transfer — the
-/// size of its receive buffer.
-const MAX_COMPRESSED_BLOCK: usize = crate::buffer::PRINT_BUF_SIZE;
+/// Largest compressed block the firmware will accept in one transfer.
+///
+/// The vendor caps a packaged block at 4000 bytes (`const T = 4e3` in
+/// `T50PlusPrint.getEncodeData()`), deliberately below the 4096-byte print
+/// buffer so the compressed stream always lands inside the firmware's receive
+/// buffer.
+const MAX_COMPRESSED_BLOCK: usize = 4000;
 
 /// Most print buffers the vendor packs into one compressed block
-/// (`T50PlusPrint.bufferMAXCount`).
-const BUFFER_MAX_COUNT: usize = 4;
+/// (`const b = 32` in `T50PlusPrint.getEncodeData()`).
+///
+/// This was 4, taken from `T80ProPrint.bufferMAXCount`. That is the T80 Pro's
+/// value, not the T50 family's. On a T50 Pro a 50×80 mm page is 8 buffers: at
+/// 32 it packs into a single block and prints in full, at 4 it splits in two
+/// and the printer lays down only the first block's worth.
+const BUFFER_MAX_COUNT: usize = 32;
 
 /// Compress data using LZMA1 (alone format) with printer-compatible parameters.
 ///
@@ -86,24 +95,32 @@ pub fn decompress_lzma(data: &[u8]) -> Result<Vec<u8>> {
 /// per transfer.
 ///
 /// Pack up to [`BUFFER_MAX_COUNT`] buffers, compress, and shrink the group
-/// until the result fits the firmware's receive buffer:
+/// until the result fits [`MAX_COMPRESSED_BLOCK`]. The vendor's loop
+/// (`T50PlusPrint.getEncodeData()`, SupvanEditor 1.1.7 `js/app.*.js`):
 ///
-/// ```java
-/// int min = Math.min(this.bufferMAXCount, list.size());
-/// do {
-///     for (int i = 0; i < min; i++) byteArrayOutputStream.write(list.get(i));
-///     bArr = LzmaUtils.LzmaEncode(byteArrayOutputStream.toByteArray());
-///     min--;
-/// } while (bArr.length > 4096);
+/// ```js
+/// const T = 4e3, b = 32;
+/// while (v < o.length) {
+///     let e = Math.min(b, o.length - v);
+///     while (e >= 1) {
+///         n = getLzma(concat(o[v .. v + e]));
+///         if (n.length <= T) break;
+///         e = Math.floor(0.75 * e);
+///         if (e < 1) e = 1;
+///     }
+///     sendData.push(n);
+///     v += e;
+/// }
 /// ```
 ///
-/// (`T80ProPrint.multiCompression`; `T50PlusPrint` carries the same
-/// `bufferMAXCount = 4` but JADX could not decompile its copy.)
+/// The group cap is what makes or breaks a long label. A 50×80 mm page is 8
+/// buffers: at 32 they pack into **one** block and the whole label prints; at
+/// 4 they split in two, and the printer lays down only the first block's
+/// worth — accepted, acknowledged, silently truncated, no error flag, and CUPS
+/// still reports the job complete.
 ///
-/// Both bounds matter. One stream for a whole page overruns the receive buffer
-/// — an 80mm label compresses to 4533 bytes — and prints garbled. One block
-/// per buffer is equally wrong: eight transfers for the same page leaves the
-/// printer marking a few millimetres and stopping.
+/// The compressed cap keeps a block inside the firmware's receive buffer. One
+/// stream for a page that does not fit overruns it and prints garbled.
 ///
 /// Returns the blocks and the mean compressed size per buffer, which feeds
 /// `calc_speed`.
@@ -135,7 +152,11 @@ pub fn compress_buffers(
                 );
                 break z;
             }
-            take -= 1;
+            // The vendor shrinks by a quarter per attempt
+            // (`e = Math.floor(0.75 * e)`) rather than one buffer at a time;
+            // on a page that does not fit, that is the difference between two
+            // or three LZMA passes and a dozen.
+            take = (take * 3 / 4).max(1);
         };
         blocks.push(block);
         next += take;
@@ -189,14 +210,32 @@ mod tests {
         assert_eq!(decompressed, data);
     }
 
-    /// Compressible buffers pack up to the vendor's cap, not all-in-one: a
-    /// whole page in a single stream overruns the firmware's receive buffer.
+    /// A short page packs into a single block, which is what makes an 8-buffer
+    /// 50×80 mm label print in full. Splitting it in two is the bug that left
+    /// half a label on the platen.
     #[test]
-    fn packing_is_capped_at_the_vendor_group_size() {
-        let buffers = vec![[0u8; 4096]; 9];
+    fn a_long_page_packs_into_one_block() {
+        // 8 buffers is a 50×80 mm page on a T50 Pro.
+        let buffers = vec![[0u8; 4096]; 8];
         let (blocks, avg) = compress_buffers(&buffers).unwrap();
-        assert_eq!(blocks.len(), 3, "9 buffers pack 4 + 4 + 1");
+        assert_eq!(blocks.len(), 1, "8 buffers must travel as one block");
         assert!(avg > 0);
+        let round: Vec<u8> = blocks
+            .iter()
+            .flat_map(|b| decompress_lzma(b).unwrap())
+            .collect();
+        assert_eq!(round, buffers.concat(), "buffers lost or reordered");
+    }
+
+    /// The group cap still bounds a page: past [`BUFFER_MAX_COUNT`] buffers the
+    /// page has to take more than one block.
+    #[test]
+    fn groups_past_the_cap_split_into_blocks() {
+        // All-zero buffers compress far below the cap, so the split is driven
+        // by the group size alone.
+        let buffers = vec![[0u8; 4096]; 64];
+        let (blocks, _) = compress_buffers(&buffers).unwrap();
+        assert_eq!(blocks.len(), 2, "64 buffers pack 32 + 32");
         let round: Vec<u8> = blocks
             .iter()
             .flat_map(|b| decompress_lzma(b).unwrap())
