@@ -13,13 +13,13 @@ use supvan_proto::buffer::{
 };
 use supvan_proto::compress::{compress_buffers, decompress_lzma};
 
-/// No block may exceed the 4000-byte cap the vendor packs to, unless it is
+/// No block may exceed the firmware's 4096-byte receive buffer, unless it is
 /// already down to a single print buffer and cannot be split further.
 fn assert_blocks_fit(blocks: &[Vec<u8>]) {
     for (i, b) in blocks.iter().enumerate() {
         let raw = decompress_lzma(b).expect("block roundtrip").len();
         assert!(
-            b.len() <= 4000 || raw == PRINT_BUF_SIZE,
+            b.len() <= 4096 || raw == PRINT_BUF_SIZE,
             "block {i}: {} compressed bytes spanning {raw} raw — too big to send",
             b.len()
         );

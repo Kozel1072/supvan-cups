@@ -1,20 +1,22 @@
 use crate::error::{Error, Result};
 
-/// Largest compressed block the firmware will accept in one transfer.
-///
-/// The vendor caps a packaged block at 4000 bytes (`const T = 4e3` in
-/// `T50PlusPrint.getEncodeData()`), deliberately below the 4096-byte print
-/// buffer so the compressed stream always lands inside the firmware's receive
-/// buffer.
-const MAX_COMPRESSED_BLOCK: usize = 4000;
+/// Largest compressed block the firmware will accept in one transfer — the
+/// size of its receive buffer.
+const MAX_COMPRESSED_BLOCK: usize = crate::buffer::PRINT_BUF_SIZE;
 
-/// Most print buffers the vendor packs into one compressed block
-/// (`const b = 32` in `T50PlusPrint.getEncodeData()`).
+/// Most print buffers the vendor packs into one compressed block.
 ///
-/// This was 4, taken from `T80ProPrint.bufferMAXCount`. That is the T80 Pro's
-/// value, not the T50 family's. On a T50 Pro a 50×80 mm page is 8 buffers: at
-/// 32 it packs into a single block and prints in full, at 4 it splits in two
-/// and the printer lays down only the first block's worth.
+/// This was 4, taken from `T80ProPrint.bufferMAXCount` in the JADX
+/// decompilation. That is the T80 Pro's value, and `T50PlusPrint` was assumed
+/// to share it because its `multiCompression()` would not decompile. The T50
+/// family's own encoder is readable in the desktop (Electron) app — webpack
+/// module `45ac`, the one `isT5080(getDevType(ProductId))` dispatches to — and
+/// it packs `const b = 32`.
+///
+/// `isT5080` covers the T50 *and* T80 families, so both share this encoder. On
+/// a T50 Pro a 50×80 mm page is 8 buffers: at 32 it packs into a single block
+/// and prints in full; at 4 it splits in two and the printer lays down only the
+/// first block's worth.
 const BUFFER_MAX_COUNT: usize = 32;
 
 /// Compress data using LZMA1 (alone format) with printer-compatible parameters.
@@ -95,8 +97,8 @@ pub fn decompress_lzma(data: &[u8]) -> Result<Vec<u8>> {
 /// per transfer.
 ///
 /// Pack up to [`BUFFER_MAX_COUNT`] buffers, compress, and shrink the group
-/// until the result fits [`MAX_COMPRESSED_BLOCK`]. The vendor's loop
-/// (`T50PlusPrint.getEncodeData()`, SupvanEditor 1.1.7 `js/app.*.js`):
+/// until the result fits [`MAX_COMPRESSED_BLOCK`]. The T50/T80 encoder's loop
+/// (desktop SupvanEditor 1.1.7, `js/app.*.js`, webpack module `45ac`):
 ///
 /// ```js
 /// const T = 4e3, b = 32;
@@ -120,7 +122,14 @@ pub fn decompress_lzma(data: &[u8]) -> Result<Vec<u8>> {
 /// still reports the job complete.
 ///
 /// The compressed cap keeps a block inside the firmware's receive buffer. One
-/// stream for a page that does not fit overruns it and prints garbled.
+/// stream for a page that does not fit overruns it and prints garbled. The
+/// vendor's own `T` is 4000, just under that buffer; we hold at the buffer size
+/// itself because this function serves every family, and the other encoders the
+/// vendor dispatches to are built around a 4096 buffer.
+///
+/// Note that the vendor packs per family, and this is the T5080 rule only. It is
+/// the correct rule for `supvan_t50` and `supvan_t80`, which share that encoder;
+/// the G, TP and SP families are not covered by it.
 ///
 /// Returns the blocks and the mean compressed size per buffer, which feeds
 /// `calc_speed`.
